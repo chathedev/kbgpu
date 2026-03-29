@@ -1,48 +1,48 @@
 """
-RunPod Serverless Handler — KB-Whisper Large Transcription
-Transcribes a single audio chunk and returns segments + word-level timestamps.
-Optimized for FlashBoot: model loaded at module level.
+RunPod Serverless — KB-Whisper Large Transcription
+Model loaded at module level for FlashBoot cold-start snapshot.
 """
-
 import os
 import time
-import requests
 import runpod
+from runpod.serverless.utils import download_files_from_urls, rp_cleanup
 from faster_whisper import WhisperModel
 
-# ── Model loading (module level for FlashBoot snapshot) ──────────────────────
-print(f"[{time.strftime('%H:%M:%S')}] Loading KB-Whisper Large model...")
+# ── Load model at module level (FlashBoot snapshots this state) ──────────────
+_t = time.time()
+print("[BOOT] Loading KB-Whisper Large onto GPU...")
 model = WhisperModel(
     "KBLab/kb-whisper-large",
     device="cuda",
     compute_type="float16",
     download_root="/models",
 )
-print(f"[{time.strftime('%H:%M:%S')}] Worker ready - KB-Whisper loaded")
+print(f"[BOOT] Model loaded in {time.time() - _t:.1f}s — worker ready")
 
 
 def handler(job):
+    t0 = time.time()
     job_input = job["input"]
     audio_url = job_input["audio_url"]
     chunk_index = job_input.get("chunk_index", 0)
-    tmp_path = f"/tmp/chunk_{chunk_index}_{int(time.time())}.wav"
 
     try:
-        # Download audio
-        print(f"[{time.strftime('%H:%M:%S')}] Chunk {chunk_index}: downloading {audio_url}")
-        resp = requests.get(audio_url, timeout=120)
-        resp.raise_for_status()
-        with open(tmp_path, "wb") as f:
-            f.write(resp.content)
-        print(f"[{time.strftime('%H:%M:%S')}] Chunk {chunk_index}: downloaded ({len(resp.content)} bytes)")
+        # Download audio via RunPod's optimized downloader
+        t1 = time.time()
+        local_paths = download_files_from_urls(job["id"], [audio_url])
+        audio_path = local_paths[0]
+        print(f"[chunk {chunk_index}] Downloaded in {time.time() - t1:.2f}s")
 
         # Transcribe
-        print(f"[{time.strftime('%H:%M:%S')}] Chunk {chunk_index}: transcribing...")
+        t2 = time.time()
         segments_gen, info = model.transcribe(
-            tmp_path,
+            audio_path,
             language="sv",
             condition_on_previous_text=False,
             word_timestamps=True,
+            beam_size=5,
+            vad_filter=True,
+            vad_parameters={"min_silence_duration_ms": 500},
         )
 
         segments = []
@@ -61,7 +61,7 @@ def handler(job):
                         "end": round(w.end, 3),
                     })
 
-        print(f"[{time.strftime('%H:%M:%S')}] Chunk {chunk_index}: done — {len(segments)} segments, {len(words)} words")
+        print(f"[chunk {chunk_index}] Transcribed in {time.time() - t2:.2f}s — {len(segments)} segs, {len(words)} words, total {time.time() - t0:.2f}s")
 
         return {
             "chunk_index": chunk_index,
@@ -70,12 +70,11 @@ def handler(job):
         }
 
     except Exception as e:
-        print(f"[{time.strftime('%H:%M:%S')}] Chunk {chunk_index}: ERROR — {e}")
+        print(f"[chunk {chunk_index}] ERROR: {e}")
         return {"error": str(e), "chunk_index": chunk_index}
 
     finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+        rp_cleanup.clean(["input_objects"])
 
 
 runpod.serverless.start({"handler": handler})

@@ -1,5 +1,4 @@
-runpod
-faster-whisper
+runpod~=1.7.9
+faster-whisper==1.1.0
 requests
-torch
-torchaudio
+huggingface_hub[hf_xet]

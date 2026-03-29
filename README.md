@@ -1,58 +1,49 @@
 # KB-Whisper Large — RunPod Serverless Transcription Worker
 
-Transcribes a single audio chunk using [KBLab/kb-whisper-large](https://huggingface.co/KBLab/kb-whisper-large) (Swedish) and returns segment-level + word-level timestamps. Designed to run 19 instances in parallel (one per audio chunk) for fast meeting transcription.
+Transcribes a single audio chunk using [KBLab/kb-whisper-large](https://huggingface.co/KBLab/kb-whisper-large) (Swedish). Returns segment + word-level timestamps. Runs 19 instances in parallel for fast meeting transcription.
 
-## Deploy on RunPod (Deploy from GitHub)
+**FlashBoot optimized**: Model loaded at module level, pre-cached in Docker image at build time. Cold starts < 200ms.
 
-1. Go to **RunPod Console → Serverless → New Endpoint**
-2. Select **Deploy from GitHub**
-3. Connect this repo: `https://github.com/chathedev/kbgpu`
-4. RunPod will detect `runpod.toml` and build automatically — no Dockerfile needed
+## Deploy on RunPod
 
-### Enable FlashBoot
+1. **Serverless → New Endpoint → Deploy from GitHub**
+2. Connect repo: `chathedev/kbgpu`, branch: `main`
+3. Dockerfile path: `Dockerfile` (auto-detected)
+4. GPU: **RTX 4090**
+5. Max Workers: **20**
+6. **Enable FlashBoot** in Endpoint Settings after creation
 
-1. After creating the endpoint, go to **Endpoint Settings**
-2. Toggle **FlashBoot** ON
-3. The model loads at module level so FlashBoot snapshots the loaded state — subsequent cold starts skip model loading entirely and boot in <200ms
+### How FlashBoot works here
 
-### Environment Variables
+The model is baked into the Docker image at build time (`builder/fetch_model.py` runs during `docker build`). At runtime, `handler.py` loads it at module level — outside the handler function. FlashBoot snapshots this loaded state. Subsequent cold starts restore the snapshot: zero model download, zero model load.
 
-These are already set in `runpod.toml` but verify they appear in your endpoint config:
+```python
+# Module level — FlashBoot snapshots this
+model = WhisperModel("KBLab/kb-whisper-large", device="cuda", compute_type="float16", download_root="/models")
 
-| Variable | Value |
-|---|---|
-| `HF_HOME` | `/models` |
-| `TRANSFORMERS_CACHE` | `/models` |
-| `HF_DATASETS_CACHE` | `/models` |
-
-### GPU & Scaling
-
-- **GPU**: RTX 4090 recommended
-- **Max Workers**: 20 (handles 19 parallel chunks + 1 buffer)
-- **Idle Timeout**: 5s recommended (FlashBoot makes cold starts cheap)
+def handler(job):
+    # model already in GPU memory
+    ...
+```
 
 ## API
 
-### Input
-
+**Input:**
 ```json
 {
   "input": {
-    "audio_url": "https://example.com/chunk_0.wav",
+    "audio_url": "https://storage.example.com/chunk_0.wav",
     "chunk_index": 0,
     "total_chunks": 19
   }
 }
 ```
 
-### Output
-
+**Output:**
 ```json
 {
   "chunk_index": 0,
-  "segments": [
-    { "text": "Hej och välkommen", "start": 0.0, "end": 1.5 }
-  ],
+  "segments": [{ "text": "Hej och välkommen", "start": 0.0, "end": 1.5 }],
   "words": [
     { "word": "Hej", "start": 0.0, "end": 0.3 },
     { "word": "och", "start": 0.35, "end": 0.5 },
@@ -61,46 +52,39 @@ These are already set in `runpod.toml` but verify they appear in your endpoint c
 }
 ```
 
-## Example: 19 Parallel Chunk Requests (Node.js)
+## Example: Fire 19 chunks in parallel (Node.js)
 
 ```javascript
 const RUNPOD_API_KEY = process.env.RUNPOD_API_KEY;
 const ENDPOINT_ID = "your-endpoint-id";
 
 async function transcribeAllChunks(chunkUrls) {
-  const requests = chunkUrls.map((url, i) =>
-    fetch(`https://api.runpod.ai/v2/${ENDPOINT_ID}/runsync`, {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${RUNPOD_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        input: {
-          audio_url: url,
-          chunk_index: i,
-          total_chunks: chunkUrls.length,
+  const results = await Promise.all(
+    chunkUrls.map((url, i) =>
+      fetch(`https://api.runpod.ai/v2/${ENDPOINT_ID}/runsync`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${RUNPOD_API_KEY}`,
+          "Content-Type": "application/json",
         },
-      }),
-    }).then((r) => r.json())
+        body: JSON.stringify({
+          input: { audio_url: url, chunk_index: i, total_chunks: chunkUrls.length },
+        }),
+      }).then((r) => r.json())
+    )
   );
 
-  // Fire all 19 chunks simultaneously
-  const results = await Promise.all(requests);
-
-  // Sort by chunk_index and assemble
-  return results
-    .map((r) => r.output)
-    .sort((a, b) => a.chunk_index - b.chunk_index);
+  return results.map((r) => r.output).sort((a, b) => a.chunk_index - b.chunk_index);
 }
 ```
 
-## FlashBoot Details
+## Repo structure
 
-The model is loaded at **module level** (outside the handler function):
-
-```python
-model = WhisperModel("KBLab/kb-whisper-large", device="cuda", ...)
 ```
-
-When FlashBoot is enabled, RunPod snapshots the worker state after the first boot. On subsequent requests, the snapshot is restored instead of re-running the import chain — the model is already in GPU memory, so there is zero model loading time.
+├── Dockerfile              # CUDA 12.3 + cuDNN 9, installs deps, pre-caches model
+├── builder/fetch_model.py  # Downloads KB-Whisper at build time
+├── handler.py              # RunPod handler, model at module level
+├── requirements.txt        # Pinned deps
+├── runpod.toml             # RunPod project config
+└── test_input.json         # Local testing
+```
