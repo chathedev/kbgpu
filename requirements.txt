@@ -1,0 +1,5 @@
+runpod
+faster-whisper
+requests
+torch
+torchaudio
