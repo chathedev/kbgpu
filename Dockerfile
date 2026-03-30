@@ -1,24 +1,14 @@
-FROM nvidia/cuda:12.3.2-cudnn9-runtime-ubuntu22.04
+FROM runpod/base:0.6.2-cuda12.1.0
 
-RUN rm -f /etc/apt/sources.list.d/*.list
-
-SHELL ["/bin/bash", "-c"]
-ENV DEBIAN_FRONTEND=noninteractive
-ENV SHELL=/bin/bash
 ENV HF_HOME=/models
 ENV TRANSFORMERS_CACHE=/models
 ENV HF_DATASETS_CACHE=/models
 
 WORKDIR /
 
-# System deps
+# ffmpeg (base image already has python3, pip, CUDA, cuDNN)
 RUN apt-get update -y && \
-    apt-get install --yes --no-install-recommends \
-    sudo ca-certificates git wget curl bash \
-    ffmpeg build-essential \
-    python3.10 python3.10-dev python3.10-venv python3-pip -y && \
-    ln -sf /usr/bin/python3.10 /usr/bin/python && \
-    ln -sf /usr/bin/python3.10 /usr/bin/python3 && \
+    apt-get install --yes --no-install-recommends ffmpeg && \
     apt-get clean -y && rm -rf /var/lib/apt/lists/*
 
 # Python deps
