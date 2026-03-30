@@ -6,13 +6,8 @@ ENV HF_DATASETS_CACHE=/models
 
 WORKDIR /
 
-# Debug: find python location in this base image
-RUN which python3 || echo "NO python3" && \
-    which python || echo "NO python" && \
-    ls -la /usr/bin/python* || true
-
 # Ensure python -> python3 symlink
-RUN if command -v python3 &>/dev/null; then ln -sf "$(which python3)" /usr/bin/python; fi
+RUN ln -sf $(which python3) /usr/bin/python 2>/dev/null || true
 
 # ffmpeg
 RUN apt-get update -y && \
@@ -24,14 +19,9 @@ COPY requirements.txt /requirements.txt
 RUN python3 -m pip install --upgrade pip && \
     python3 -m pip install --no-cache-dir -r /requirements.txt
 
-# Verify installs
-RUN python3 -c "import huggingface_hub; print('huggingface_hub OK:', huggingface_hub.__version__)"
-RUN python3 -c "import faster_whisper; print('faster_whisper OK')"
-
-# Pre-download KB-Whisper model at build time (critical for FlashBoot)
-COPY builder/fetch_model.py /fetch_model.py
-RUN python3 -u /fetch_model.py
-RUN rm -f /fetch_model.py
+# Skip model download at build — download on first boot instead.
+# This avoids build failures from GPU-dependent imports during docker build.
+# FlashBoot snapshot will cache the model after first successful boot.
 
 # Copy handler
 COPY handler.py /handler.py
