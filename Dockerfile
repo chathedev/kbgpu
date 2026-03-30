@@ -6,26 +6,35 @@ ENV HF_DATASETS_CACHE=/models
 
 WORKDIR /
 
-# Ensure python -> python3 symlink exists
-RUN ln -sf /usr/bin/python3 /usr/bin/python
+# Debug: find python location in this base image
+RUN which python3 || echo "NO python3" && \
+    which python || echo "NO python" && \
+    ls -la /usr/bin/python* || true
 
-# ffmpeg (base image already has python3, pip, CUDA, cuDNN)
+# Ensure python -> python3 symlink
+RUN if command -v python3 &>/dev/null; then ln -sf "$(which python3)" /usr/bin/python; fi
+
+# ffmpeg
 RUN apt-get update -y && \
     apt-get install --yes --no-install-recommends ffmpeg && \
     apt-get clean -y && rm -rf /var/lib/apt/lists/*
 
 # Python deps
 COPY requirements.txt /requirements.txt
-RUN pip install --upgrade pip && \
-    pip install --no-cache-dir -r /requirements.txt
+RUN python3 -m pip install --upgrade pip && \
+    python3 -m pip install --no-cache-dir -r /requirements.txt
+
+# Verify installs
+RUN python3 -c "import huggingface_hub; print('huggingface_hub OK:', huggingface_hub.__version__)"
+RUN python3 -c "import faster_whisper; print('faster_whisper OK')"
 
 # Pre-download KB-Whisper model at build time (critical for FlashBoot)
 COPY builder/fetch_model.py /fetch_model.py
-RUN python /fetch_model.py || (echo "=== FETCH MODEL FAILED ===" && echo "--- script content ---" && cat /fetch_model.py && echo "--- pip list ---" && pip list 2>&1 | grep -i -E "hugging|faster|whisper" && exit 1)
+RUN python3 -u /fetch_model.py
 RUN rm -f /fetch_model.py
 
 # Copy handler
 COPY handler.py /handler.py
 COPY test_input.json /test_input.json
 
-CMD ["python", "-u", "/handler.py"]
+CMD ["python3", "-u", "/handler.py"]
