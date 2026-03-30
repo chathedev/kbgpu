@@ -6,6 +6,9 @@ ENV HF_DATASETS_CACHE=/models
 
 WORKDIR /
 
+# Ensure python -> python3 symlink exists
+RUN ln -sf /usr/bin/python3 /usr/bin/python
+
 # ffmpeg (base image already has python3, pip, CUDA, cuDNN)
 RUN apt-get update -y && \
     apt-get install --yes --no-install-recommends ffmpeg && \
