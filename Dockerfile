@@ -21,7 +21,8 @@ RUN pip install --upgrade pip && \
 
 # Pre-download KB-Whisper model at build time (critical for FlashBoot)
 COPY builder/fetch_model.py /fetch_model.py
-RUN python /fetch_model.py && rm /fetch_model.py
+RUN python /fetch_model.py || (echo "=== FETCH MODEL FAILED ===" && echo "--- script content ---" && cat /fetch_model.py && echo "--- pip list ---" && pip list 2>&1 | grep -i -E "hugging|faster|whisper" && exit 1)
+RUN rm -f /fetch_model.py
 
 # Copy handler
 COPY handler.py /handler.py
