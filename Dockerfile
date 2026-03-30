@@ -19,9 +19,11 @@ COPY requirements.txt /requirements.txt
 RUN python3 -m pip install --upgrade pip && \
     python3 -m pip install --no-cache-dir -r /requirements.txt
 
-# Skip model download at build — download on first boot instead.
-# This avoids build failures from GPU-dependent imports during docker build.
-# FlashBoot snapshot will cache the model after first successful boot.
+# Download model at BUILD TIME — baked into image for instant worker starts
+RUN python3 -c "from huggingface_hub import snapshot_download; snapshot_download('KBLab/kb-whisper-large', local_dir='/models/kb-whisper-large', ignore_patterns=['*.msgpack','*.h5','flax_model*','tf_model*','onnx/*'])"
+
+# Verify model files exist
+RUN ls -la /models/kb-whisper-large/ && python3 -c "import os; files=os.listdir('/models/kb-whisper-large'); print(f'Model files: {len(files)}'); assert len(files)>3, 'Model download incomplete'"
 
 # Copy handler
 COPY handler.py /handler.py
