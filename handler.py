@@ -6,8 +6,9 @@ Model MUST be pre-downloaded at /models/kb-whisper-large during Docker build.
 import os
 import sys
 import time
+import base64
+import tempfile
 import runpod
-from runpod.serverless.utils import download_files_from_urls, rp_cleanup
 
 MODEL_PATH = "/models/kb-whisper-large"
 
@@ -32,16 +33,34 @@ print(f"[BOOT] Model loaded in {time.time() - _t:.1f}s — worker ready", flush=
 def handler(job):
     t0 = time.time()
     job_input = job["input"]
-    audio_url = job_input["audio_url"]
+    audio_base64 = job_input.get("audio_base64")
+    audio_url = job_input.get("audio_url")
     chunk_index = job_input.get("chunk_index", 0)
     language = job_input.get("language", "sv")
+    audio_path = None
+    _tmp_path = None
 
     try:
-        # Download audio via RunPod's optimized downloader
         t1 = time.time()
-        local_paths = download_files_from_urls(job["id"], [audio_url])
-        audio_path = local_paths[0]
-        print(f"[chunk {chunk_index}] Downloaded in {time.time() - t1:.2f}s", flush=True)
+        if audio_base64:
+            # Decode base64 audio to a temp file
+            raw = base64.b64decode(audio_base64)
+            fd, _tmp_path = tempfile.mkstemp(suffix=".wav")
+            with os.fdopen(fd, "wb") as f:
+                f.write(raw)
+            audio_path = _tmp_path
+            print(f"[chunk {chunk_index}] Decoded base64 ({len(raw)} bytes) in {time.time() - t1:.2f}s", flush=True)
+        elif audio_url:
+            import requests as _req
+            resp = _req.get(audio_url, timeout=30)
+            resp.raise_for_status()
+            fd, _tmp_path = tempfile.mkstemp(suffix=".wav")
+            with os.fdopen(fd, "wb") as f:
+                f.write(resp.content)
+            audio_path = _tmp_path
+            print(f"[chunk {chunk_index}] Downloaded ({len(resp.content)} bytes) in {time.time() - t1:.2f}s", flush=True)
+        else:
+            return {"error": "audio_base64 or audio_url required", "chunk_index": chunk_index}
 
         # Transcribe
         t2 = time.time()
@@ -94,7 +113,11 @@ def handler(job):
         return {"error": str(e), "chunk_index": chunk_index}
 
     finally:
-        rp_cleanup.clean(["input_objects"])
+        if _tmp_path and os.path.exists(_tmp_path):
+            try:
+                os.unlink(_tmp_path)
+            except OSError:
+                pass
 
 
 runpod.serverless.start({"handler": handler})
