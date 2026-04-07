@@ -1,6 +1,6 @@
 import os
+import json
 import logging
-import tempfile
 import shutil
 from typing import Optional
 
@@ -12,14 +12,13 @@ TITANET_MODEL_PATH = "/models/nemo/titanet-large.nemo"
 
 def diarize(audio_path: str, num_speakers: Optional[int] = None, job_id: Optional[str] = None) -> list[dict]:
     """
-    Run NeMo ClusteringDiarizer with MSDD for speaker diarization.
+    Run NeMo NeuralDiarizer (MSDD) for speaker diarization.
 
-    Returns list of segments:
+    Returns list of segments sorted by start time:
     {"speaker": str, "start": float, "end": float}
-    Sorted by start time.
     """
     from omegaconf import OmegaConf
-    from nemo.collections.asr.models import ClusteringDiarizer
+    from nemo.collections.asr.models import NeuralDiarizer
 
     job_tag = job_id or "default"
     tmp_dir = f"/tmp/nemo_{job_tag}"
@@ -28,9 +27,8 @@ def diarize(audio_path: str, num_speakers: Optional[int] = None, job_id: Optiona
     try:
         logger.info(f"Starting diarization: {audio_path}, num_speakers={num_speakers}")
 
-        # Build manifest file pointing to our audio
+        # Write manifest
         manifest_path = os.path.join(tmp_dir, "manifest.json")
-        import json
         with open(manifest_path, "w") as f:
             json.dump({
                 "audio_filepath": audio_path,
@@ -44,25 +42,27 @@ def diarize(audio_path: str, num_speakers: Optional[int] = None, job_id: Optiona
             }, f)
             f.write("\n")
 
-        # Build NeMo diarization config
-        cfg = _build_diarizer_config(tmp_dir, manifest_path, num_speakers)
+        # Build NeuralDiarizer config
+        cfg = _build_neural_diarizer_config(tmp_dir, manifest_path, num_speakers)
 
         # Run diarization
-        diarizer = ClusteringDiarizer(cfg=cfg)
+        diarizer = NeuralDiarizer(cfg=cfg)
         diarizer.diarize()
 
-        # Parse RTTM output
-        rttm_path = os.path.join(tmp_dir, "pred_rttms", os.path.splitext(os.path.basename(audio_path))[0] + ".rttm")
+        # Parse RTTM — NeuralDiarizer writes to out_dir/pred_rttms/<stem>.rttm
+        audio_stem = os.path.splitext(os.path.basename(audio_path))[0]
+        rttm_path = os.path.join(tmp_dir, "pred_rttms", audio_stem + ".rttm")
         segments = _parse_rttm(rttm_path)
 
-        logger.info(f"Diarization complete: {len(segments)} segments, {len({s['speaker'] for s in segments})} speakers")
+        num_spk = len({s["speaker"] for s in segments})
+        logger.info(f"Diarization complete: {len(segments)} segments, {num_spk} speakers")
         return segments
 
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-def _build_diarizer_config(tmp_dir: str, manifest_path: str, num_speakers: Optional[int]):
+def _build_neural_diarizer_config(tmp_dir: str, manifest_path: str, num_speakers: Optional[int]):
     from omegaconf import OmegaConf
 
     cfg_dict = {
@@ -102,7 +102,7 @@ def _build_diarizer_config(tmp_dir: str, manifest_path: str, num_speakers: Optio
             "clustering": {
                 "parameters": {
                     "oracle_num_speakers": num_speakers is not None,
-                    "max_num_speakers": 12,
+                    "max_num_speakers": num_speakers if num_speakers else 12,
                     "enhanced_count_thres": 80,
                     "max_rp_threshold": 0.25,
                     "sparse_search_volume": 30,
@@ -127,11 +127,6 @@ def _build_diarizer_config(tmp_dir: str, manifest_path: str, num_speakers: Optio
         },
     }
 
-    # If num_speakers is provided, override oracle count
-    if num_speakers is not None:
-        cfg_dict["diarizer"]["clustering"]["parameters"]["oracle_num_speakers"] = True
-        cfg_dict["diarizer"]["clustering"]["parameters"]["max_num_speakers"] = num_speakers
-
     return OmegaConf.create(cfg_dict)
 
 
@@ -150,7 +145,7 @@ def _parse_rttm(rttm_path: str) -> list[dict]:
             parts = line.split()
             if len(parts) < 9:
                 continue
-            # RTTM format: SPEAKER file 1 start duration <NA> <NA> speaker <NA>
+            # RTTM: SPEAKER file 1 start duration <NA> <NA> speaker <NA>
             start = float(parts[3])
             duration = float(parts[4])
             speaker = parts[7]
