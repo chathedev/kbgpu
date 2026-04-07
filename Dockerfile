@@ -2,21 +2,18 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # kbgpu — Swedish ASR pipeline (KB-Whisper + NeMo diarization)
 #
-# Layer order is intentional for maximum GHA cache reuse:
-#   1. System deps          — changes: never
-#   2. PyTorch cu121        — changes: rarely
-#   3. Heavy ML libs        — changes: rarely
-#   3b. Pin torch back      — NeMo upgrades torch to cu13; re-pin to cu121
-#   4. Light deps           — changes: occasionally
-#   5. Model weights        — changes: when download_models.py changes
-#   6. App code             — changes: every commit  ← fast, no pip at all
+# CUDA version strategy:
+#   RunPod workers have driver 550 = CUDA 12.4.
+#   nemo_toolkit 2.7+ resolves torch 2.11/cu13 which needs driver ≥560 → crash.
+#   Fix: base on cuda:12.4.1 (no cudnn — saves ~600MB vs cudnn variant),
+#   install torch cu124, then force-reinstall after nemo overwrites it.
 #
-# KEY ISSUE: nemo_toolkit 2.x resolves to torch 2.11 + nvidia-cuda-runtime-13
-# which requires CUDA driver ≥560. RunPod workers have driver 550 (CUDA 12.4).
-# Fix: force-reinstall torch cu121 AFTER nemo so the driver-compatible wheel wins.
+# Disk budget on GHA free runners: ~14GB.
+#   cuda:12.4.1-runtime-ubuntu22.04 = ~5.5GB compressed
+#   vs cuda:12.4.1-cudnn-runtime = ~7.5GB → runs out of space
 # ─────────────────────────────────────────────────────────────────────────────
 
-FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -41,12 +38,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install --upgrade pip setuptools wheel
 
-# ── 2. PyTorch (CUDA 12.4) ───────────────────────────────────────────────────
-# Install torch cu124 to match RunPod worker driver (550.x = CUDA 12.4).
-# torchaudio NOT from pytorch.org (CUDA wheel dlopen fails on CPU build runners).
+# ── 2. PyTorch cu124 ─────────────────────────────────────────────────────────
+# Match RunPod worker driver (550.x = CUDA 12.4).
+# torchaudio NOT from pytorch.org — CUDA wheel dlopen-fails on CPU build runners.
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install \
-    "torch>=2.2.0,<2.6.0" \
+    pip install "torch>=2.2.0,<2.6.0" \
     --index-url https://download.pytorch.org/whl/cu124
 
 # ── 3. Heavy ML libraries ─────────────────────────────────────────────────────
@@ -55,11 +51,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -r /tmp/requirements-ml.txt
 
 # ── 3b. Re-pin torch to cu124 ─────────────────────────────────────────────────
-# nemo_toolkit resolves latest torch (2.11+, cu13) which needs driver ≥560.
-# Force-reinstall cu124 wheel so we always use the driver-compatible version.
+# nemo_toolkit resolves torch 2.11+/cu13 (driver ≥560 required — workers have 550).
+# Force-reinstall cu124 wheel after nemo to override it. --no-deps avoids cascade.
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install \
-    "torch>=2.2.0,<2.6.0" \
+    pip install "torch>=2.2.0,<2.6.0" \
     --index-url https://download.pytorch.org/whl/cu124 \
     --force-reinstall --no-deps
 
