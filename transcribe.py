@@ -37,8 +37,8 @@ def transcribe(audio_path: str, model: WhisperModel) -> list[dict]:
         vad_filter=True,
         vad_parameters={"min_silence_duration_ms": 500},
         beam_size=5,
-        best_of=5,
         temperature=0.0,
+        # best_of is ignored when temperature=0.0 — omitted for clarity
     )
 
     logger.info(f"Detected language: {info.language} (prob={info.language_probability:.2f}), duration={info.duration:.1f}s")

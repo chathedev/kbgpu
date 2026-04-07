@@ -98,9 +98,10 @@ def _build_diarizer_config(tmp_dir: str, manifest_path: str, num_speakers: Optio
             "speaker_embeddings": {
                 "model_path": TITANET_MODEL_PATH,
                 "parameters": {
-                    "window_length_in_sec": [1.5, 1.25, 1.0, 0.75, 0.5],
-                    "shift_length_in_sec": [0.75, 0.625, 0.5, 0.375, 0.25],
-                    "multiscale_weights": [1, 1, 1, 1, 1],
+                    # 3 scales instead of 5 — ~40% faster embedding with minimal quality loss
+                    "window_length_in_sec": [1.5, 1.0, 0.5],
+                    "shift_length_in_sec": [0.75, 0.5, 0.25],
+                    "multiscale_weights": [1, 1, 1],
                     "save_embeddings": False,
                 },
             },

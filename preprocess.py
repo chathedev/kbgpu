@@ -4,20 +4,23 @@ import tempfile
 import numpy as np
 import soundfile as sf
 import librosa
-import torch
 
 logger = logging.getLogger(__name__)
 
 TARGET_SR = 16000
 
+# Demucs is only useful for music/noise separation.
+# Meeting recordings are pure speech — skip by default for 2-3 min speedup.
+ENABLE_DEMUCS = os.environ.get("ENABLE_DEMUCS", "0").strip() == "1"
+
 
 def preprocess_audio(input_path: str) -> str:
     """
-    Load audio, run Demucs vocal separation, resample to 16kHz mono WAV.
-    Falls back to raw audio if Demucs fails.
+    Load audio, optionally run Demucs vocal separation, resample to 16kHz mono WAV.
+    ENABLE_DEMUCS=1 to enable Demucs (off by default for meeting recordings).
     Returns path to cleaned WAV file.
     """
-    logger.info(f"Preprocessing audio: {input_path}")
+    logger.info(f"Preprocessing audio: {input_path} (demucs={ENABLE_DEMUCS})")
 
     # Load audio with librosa - handles any format ffmpeg can decode
     audio, sr = librosa.load(input_path, sr=None, mono=False)
@@ -29,19 +32,18 @@ def preprocess_audio(input_path: str) -> str:
     duration = audio.shape[-1] / sr
     logger.info(f"Audio loaded: {duration:.1f}s, {audio.shape[0]}ch, {sr}Hz")
 
-    # Try Demucs vocal separation
-    try:
-        vocals = _run_demucs(audio, sr)
-        logger.info("Demucs separation successful")
-    except Exception as e:
-        logger.warning(f"Demucs failed, falling back to raw audio: {e}")
-        vocals = audio
+    if ENABLE_DEMUCS:
+        try:
+            audio = _run_demucs(audio, sr)
+            logger.info("Demucs separation successful")
+        except Exception as e:
+            logger.warning(f"Demucs failed, falling back to raw audio: {e}")
 
     # Mix to mono
-    if vocals.ndim > 1 and vocals.shape[0] > 1:
-        mono = vocals.mean(axis=0)
+    if audio.ndim > 1 and audio.shape[0] > 1:
+        mono = audio.mean(axis=0)
     else:
-        mono = vocals.squeeze()
+        mono = audio.squeeze()
 
     # Resample to 16kHz
     if sr != TARGET_SR:
@@ -68,6 +70,7 @@ def _run_demucs(audio: np.ndarray, sr: int) -> np.ndarray:
     audio: (channels, samples) float32 numpy array
     Returns: (channels, samples) vocals numpy array
     """
+    import torch
     import demucs.pretrained
     import demucs.apply
     from demucs.audio import convert_audio
@@ -79,31 +82,27 @@ def _run_demucs(audio: np.ndarray, sr: int) -> np.ndarray:
     model.to(device)
     model.eval()
 
-    # Convert audio to tensor: (1, channels, samples)
     wav = torch.from_numpy(audio).float()
     if wav.ndim == 1:
         wav = wav.unsqueeze(0)
-    wav = wav.unsqueeze(0)  # batch dim
+    wav = wav.unsqueeze(0)
 
-    # Resample to model's expected sr if needed
     wav = convert_audio(wav, sr, model.samplerate, model.audio_channels)
 
     with torch.no_grad():
-        sources = demucs.apply.apply_model(model, wav, device=device, shifts=1, split=True, overlap=0.25, progress=False)
+        sources = demucs.apply.apply_model(
+            model, wav, device=device, shifts=1, split=True, overlap=0.25, progress=False
+        )
 
-    # sources shape: (batch, sources, channels, samples)
-    # htdemucs sources: drums, bass, other, vocals
     source_names = model.sources
     vocals_idx = source_names.index("vocals")
-    vocals = sources[0, vocals_idx]  # (channels, samples)
+    vocals = sources[0, vocals_idx]
 
-    # Resample back to original sr if model changed it
     if model.samplerate != sr:
         vocals_np = vocals.cpu().numpy()
-        vocals_resampled = np.stack([
+        return np.stack([
             librosa.resample(vocals_np[c], orig_sr=model.samplerate, target_sr=sr)
             for c in range(vocals_np.shape[0])
         ])
-        return vocals_resampled
 
     return vocals.cpu().numpy()
