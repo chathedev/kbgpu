@@ -4,18 +4,19 @@
 #
 # Layer order is intentional for maximum GHA cache reuse:
 #   1. System deps          — changes: never
-#   2. PyTorch (CUDA)       — changes: rarely
+#   2. PyTorch cu121        — changes: rarely
 #   3. Heavy ML libs        — changes: rarely
+#   3b. Pin torch back      — NeMo upgrades torch to cu13; re-pin to cu121
 #   4. Light deps           — changes: occasionally
 #   5. Model weights        — changes: when download_models.py changes
 #   6. App code             — changes: every commit  ← fast, no pip at all
 #
-# BuildKit pip cache mounts (--mount=type=cache) make even a cache-miss
-# layer fast: packages are read from the runner's local pip cache instead
-# of re-downloaded from PyPI.
+# KEY ISSUE: nemo_toolkit 2.x resolves to torch 2.11 + nvidia-cuda-runtime-13
+# which requires CUDA driver ≥560. RunPod workers have driver 550 (CUDA 12.4).
+# Fix: force-reinstall torch cu121 AFTER nemo so the driver-compatible wheel wins.
 # ─────────────────────────────────────────────────────────────────────────────
 
-FROM nvidia/cuda:12.1.0-cudnn8-runtime-ubuntu22.04
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -40,24 +41,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install --upgrade pip setuptools wheel
 
-# ── 2. PyTorch (CUDA) ────────────────────────────────────────────────────────
-# Install ONLY torch CUDA here. torchaudio is intentionally NOT installed
-# from pytorch.org — the CUDA torchaudio wheel links against libcuda.so which
-# doesn't exist on GHA's CPU-only build runners, causing dlopen to fail during
-# `download_models.py`. We let nemo_toolkit pull its own compatible torchaudio
-# from PyPI (a CPU wheel that dlopen-succeeds everywhere). The CUDA torch is
-# all that's needed for GPU tensor ops; torchaudio CPU handles audio I/O fine.
+# ── 2. PyTorch (CUDA 12.4) ───────────────────────────────────────────────────
+# Install torch cu124 to match RunPod worker driver (550.x = CUDA 12.4).
+# torchaudio NOT from pytorch.org (CUDA wheel dlopen fails on CPU build runners).
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install \
-    "torch>=2.2.0" \
-    --index-url https://download.pytorch.org/whl/cu121
+    "torch>=2.2.0,<2.6.0" \
+    --index-url https://download.pytorch.org/whl/cu124
 
 # ── 3. Heavy ML libraries ─────────────────────────────────────────────────────
-# nemo_toolkit pulls in ~200 transitive packages (transformers, scipy, etc.)
-# faster-whisper is relatively light but listed here since it changes rarely.
 COPY requirements-ml.txt /tmp/requirements-ml.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -r /tmp/requirements-ml.txt
+
+# ── 3b. Re-pin torch to cu124 ─────────────────────────────────────────────────
+# nemo_toolkit resolves latest torch (2.11+, cu13) which needs driver ≥560.
+# Force-reinstall cu124 wheel so we always use the driver-compatible version.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install \
+    "torch>=2.2.0,<2.6.0" \
+    --index-url https://download.pytorch.org/whl/cu124 \
+    --force-reinstall --no-deps
 
 # ── 4. Light runtime dependencies ────────────────────────────────────────────
 COPY requirements.txt /tmp/requirements.txt
@@ -65,14 +69,11 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -r /tmp/requirements.txt
 
 # ── 5. Download and bake model weights into image ─────────────────────────────
-# This layer is cached by GHA as long as download_models.py doesn't change.
-# When it does change, the ~15 min download runs once and is cached again.
 WORKDIR /app
 COPY download_models.py .
 RUN python3 download_models.py
 
 # ── 6. Application code ───────────────────────────────────────────────────────
-# Copied last so code changes don't bust the expensive layers above.
 COPY handler.py transcribe.py diarize.py merge.py preprocess.py ./
 
 CMD ["python3", "-u", "handler.py"]
