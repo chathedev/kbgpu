@@ -35,17 +35,28 @@ except Exception as e:
     print(f"TitaNet FAILED: {e}", flush=True)
     sys.exit(1)
 
-# ── 3. MSDD telephony (multi-scale diarization decoder) ──────────────────────
-print("=== Downloading MSDD telephony ===", flush=True)
-try:
-    from nemo.collections.asr.models import EncDecDiarLabelModel
-    msdd = EncDecDiarLabelModel.from_pretrained("diar_msdd_telephony")
-    msdd.save_to("/models/nemo/diar_msdd_telephony.nemo")
-    del msdd
-    print("MSDD telephony: OK -> /models/nemo/diar_msdd_telephony.nemo", flush=True)
-except Exception as e:
-    print(f"MSDD FAILED: {e}", flush=True)
-    sys.exit(1)
+# ── 3. MSDD (multi-scale diarization decoder) — optional ─────────────────────
+# NeMo 2.x renamed/restructured MSDD models. Try known names, warn on failure.
+print("=== Downloading MSDD model (optional) ===", flush=True)
+MSDD_CANDIDATES = [
+    "diar_msdd_telephony",   # NeMo 1.x name
+    "diar_msdd_meeting",     # NeMo 2.x name
+]
+msdd_ok = False
+for model_name in MSDD_CANDIDATES:
+    try:
+        from nemo.collections.asr.models import EncDecDiarLabelModel
+        msdd = EncDecDiarLabelModel.from_pretrained(model_name)
+        msdd.save_to("/models/nemo/diar_msdd.nemo")
+        del msdd
+        print(f"MSDD ({model_name}): OK -> /models/nemo/diar_msdd.nemo", flush=True)
+        msdd_ok = True
+        break
+    except Exception as e:
+        print(f"MSDD ({model_name}) not available: {e}", flush=True)
+
+if not msdd_ok:
+    print("MSDD: No model available — diarizer will use clustering-only (still effective)", flush=True)
 
 # ── 4. Demucs htdemucs (vocal separation) ────────────────────────────────────
 print("=== Downloading Demucs htdemucs ===", flush=True)
@@ -57,4 +68,4 @@ except Exception as e:
     print(f"Demucs FAILED: {e}", flush=True)
     sys.exit(1)
 
-print("=== All models downloaded successfully ===", flush=True)
+print("=== All required models downloaded successfully ===", flush=True)

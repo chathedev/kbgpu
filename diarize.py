@@ -6,13 +6,16 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-MSDD_MODEL_PATH = "/models/nemo/diar_msdd_telephony.nemo"
+MSDD_MODEL_PATH = "/models/nemo/diar_msdd.nemo"
 TITANET_MODEL_PATH = "/models/nemo/titanet-large.nemo"
+
+_MSDD_AVAILABLE = os.path.exists(MSDD_MODEL_PATH)
 
 
 def diarize(audio_path: str, num_speakers: Optional[int] = None, job_id: Optional[str] = None) -> list[dict]:
     """
-    Run NeMo ClusteringDiarizer with MSDD for speaker diarization.
+    Run NeMo ClusteringDiarizer for speaker diarization.
+    Uses MSDD model if available, otherwise falls back to pure clustering.
 
     Returns list of segments sorted by start time:
     {"speaker": str, "start": float, "end": float}
@@ -25,7 +28,7 @@ def diarize(audio_path: str, num_speakers: Optional[int] = None, job_id: Optiona
     os.makedirs(tmp_dir, exist_ok=True)
 
     try:
-        logger.info(f"Starting diarization: {audio_path}, num_speakers={num_speakers}")
+        logger.info(f"Starting diarization: {audio_path}, num_speakers={num_speakers}, msdd={_MSDD_AVAILABLE}")
 
         # Write manifest
         manifest_path = os.path.join(tmp_dir, "manifest.json")
@@ -79,12 +82,10 @@ def _build_diarizer_config(tmp_dir: str, manifest_path: str, num_speakers: Optio
                 "model_path": "vad_multilingual_marblenet",
                 "external_vad_manifest": None,
                 "parameters": {
-                    # Frame-level VAD params (required by NeMo's VAD runner)
                     "window_length_in_sec": 0.15,
                     "shift_length_in_sec": 0.01,
                     "smoothing": "median",
                     "overlap": 0.5,
-                    # Threshold / padding
                     "onset": 0.8,
                     "offset": 0.6,
                     "pad_onset": 0.1,
@@ -113,23 +114,29 @@ def _build_diarizer_config(tmp_dir: str, manifest_path: str, num_speakers: Optio
                     "maj_vote_spk_count": False,
                 },
             },
-            "msdd_model": {
-                "model_path": MSDD_MODEL_PATH,
-                "parameters": {
-                    "use_speaker_model_from_ckpt": True,
-                    "infer_batch_size": 25,
-                    "sigmoid_threshold": [0.5, 0.5],
-                    "seq_eval_mode": False,
-                    "split_infer": True,
-                    "diar_eval_settings": [
-                        [0.25, True],
-                        [0.25, False],
-                        [0.0, False],
-                    ],
-                },
-            },
         },
     }
+
+    # Only add MSDD config if model file is available
+    if _MSDD_AVAILABLE:
+        cfg_dict["diarizer"]["msdd_model"] = {
+            "model_path": MSDD_MODEL_PATH,
+            "parameters": {
+                "use_speaker_model_from_ckpt": True,
+                "infer_batch_size": 25,
+                "sigmoid_threshold": [0.5, 0.5],
+                "seq_eval_mode": False,
+                "split_infer": True,
+                "diar_eval_settings": [
+                    [0.25, True],
+                    [0.25, False],
+                    [0.0, False],
+                ],
+            },
+        }
+        logger.info("Using MSDD model for enhanced diarization")
+    else:
+        logger.info("MSDD model not available — using pure clustering diarization")
 
     return OmegaConf.create(cfg_dict)
 
