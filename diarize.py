@@ -12,13 +12,13 @@ TITANET_MODEL_PATH = "/models/nemo/titanet-large.nemo"
 
 def diarize(audio_path: str, num_speakers: Optional[int] = None, job_id: Optional[str] = None) -> list[dict]:
     """
-    Run NeMo NeuralDiarizer (MSDD) for speaker diarization.
+    Run NeMo ClusteringDiarizer with MSDD for speaker diarization.
 
     Returns list of segments sorted by start time:
     {"speaker": str, "start": float, "end": float}
     """
     from omegaconf import OmegaConf
-    from nemo.collections.asr.models import NeuralDiarizer
+    from nemo.collections.asr.models import ClusteringDiarizer
 
     job_tag = job_id or "default"
     tmp_dir = f"/tmp/nemo_{job_tag}"
@@ -42,14 +42,12 @@ def diarize(audio_path: str, num_speakers: Optional[int] = None, job_id: Optiona
             }, f)
             f.write("\n")
 
-        # Build NeuralDiarizer config
-        cfg = _build_neural_diarizer_config(tmp_dir, manifest_path, num_speakers)
+        cfg = _build_diarizer_config(tmp_dir, manifest_path, num_speakers)
 
-        # Run diarization
-        diarizer = NeuralDiarizer(cfg=cfg)
+        diarizer = ClusteringDiarizer(cfg=cfg)
         diarizer.diarize()
 
-        # Parse RTTM — NeuralDiarizer writes to out_dir/pred_rttms/<stem>.rttm
+        # ClusteringDiarizer writes RTTM to out_dir/pred_rttms/<stem>.rttm
         audio_stem = os.path.splitext(os.path.basename(audio_path))[0]
         rttm_path = os.path.join(tmp_dir, "pred_rttms", audio_stem + ".rttm")
         segments = _parse_rttm(rttm_path)
@@ -62,7 +60,7 @@ def diarize(audio_path: str, num_speakers: Optional[int] = None, job_id: Optiona
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-def _build_neural_diarizer_config(tmp_dir: str, manifest_path: str, num_speakers: Optional[int]):
+def _build_diarizer_config(tmp_dir: str, manifest_path: str, num_speakers: Optional[int]):
     from omegaconf import OmegaConf
 
     cfg_dict = {

@@ -42,23 +42,24 @@ print('Downloading KB-Whisper-large...'); \
 WhisperModel('KBLab/kb-whisper-large', device='cpu', compute_type='int8', download_root='/models/whisper'); \
 print('KB-Whisper-large downloaded successfully')"
 
-# Pre-download NeMo diarization models via Python (NGC wget requires auth; NeMo API is public)
-ENV NEMO_CACHE_DIR=/models/nemo_cache
-RUN python3 -c "\
+# Pre-download NeMo diarization models via Python API (NGC wget requires auth tokens)
+# EncDecSpeakerLabelModel = TitaNet (speaker embeddings)
+# EncDecDiarLabelModel    = MSDD multi-scale diarizer
+RUN mkdir -p /models/nemo && python3 -c "\
 import os; \
-os.makedirs('/models/nemo_cache', exist_ok=True); \
-import nemo.collections.asr as nemo_asr; \
+os.makedirs('/models/nemo', exist_ok=True); \
+from nemo.collections.asr.models import EncDecSpeakerLabelModel, EncDecDiarLabelModel; \
 print('Downloading TitaNet Large...'); \
-m = nemo_asr.models.EncDecSpeakerLabelModel.from_pretrained('nvidia/speakerverification_en_titanet_large'); \
-m.save_to('/models/nemo/titanet-large.nemo'); \
-print('TitaNet saved'); \
-del m; \
+titanet = EncDecSpeakerLabelModel.from_pretrained('nvidia/speakerverification_en_titanet_large'); \
+titanet.save_to('/models/nemo/titanet-large.nemo'); \
+print('TitaNet saved to /models/nemo/titanet-large.nemo'); \
+del titanet; \
 print('Downloading MSDD telephony...'); \
-from nemo.collections.asr.models import NeuralDiarizer; \
-d = NeuralDiarizer.from_pretrained('diar_msdd_telephony'); \
-d.save_to('/models/nemo/diar_msdd_telephony.nemo'); \
-print('MSDD saved'); \
-del d"
+msdd = EncDecDiarLabelModel.from_pretrained('diar_msdd_telephony'); \
+msdd.save_to('/models/nemo/diar_msdd_telephony.nemo'); \
+print('MSDD saved to /models/nemo/diar_msdd_telephony.nemo'); \
+del msdd; \
+print('All NeMo models downloaded')"
 
 # Pre-download Demucs htdemucs model
 RUN python3 -c "\
