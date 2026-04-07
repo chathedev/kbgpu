@@ -1,11 +1,9 @@
 import os
 import time
 import logging
-import tempfile
 import requests
 import runpod
 import soundfile as sf
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
 
 # Configure logging
@@ -70,34 +68,29 @@ def handler(job: dict) -> dict:
         downloaded_path = _download_audio(audio_url, job_id)
         logger.info(f"[{job_id}] Download: {time.time()-t0:.1f}s")
 
-        # 2. Preprocess: ffmpeg → 16kHz mono WAV (fast, ~5s)
+        # 2. Preprocess: ffmpeg → 16kHz mono WAV (~5s regardless of file size)
         t0 = time.time()
         preprocessed_path = preprocess_audio(downloaded_path)
         logger.info(f"[{job_id}] Preprocess: {time.time()-t0:.1f}s")
 
-        # Get duration from preprocessed WAV before spawning threads
+        # Get duration
         with sf.SoundFile(preprocessed_path) as f:
             duration_seconds = round(len(f) / f.samplerate, 2)
         logger.info(f"[{job_id}] Audio duration: {duration_seconds:.1f}s")
 
-        # 3+4. Transcribe + Diarize in PARALLEL on the same A6000
-        #   - KB-Whisper (CTranslate2 float16) uses CUDA stream
-        #   - NeMo TitaNet+VAD uses PyTorch CUDA
-        #   - Both release the GIL during CUDA ops → true parallelism
-        #   - A6000 has 48GB VRAM, both models fit easily (~3GB + ~2GB)
+        # 3. Transcribe with KB-Whisper-large (GPU, CTranslate2)
         t0 = time.time()
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            transcribe_future = executor.submit(transcribe, preprocessed_path, _whisper_model)
-            diarize_future = executor.submit(
-                diarize, preprocessed_path, num_speakers=num_speakers, job_id=job_id
-            )
-            # Collect results — re-raise any exception from the threads
-            words = transcribe_future.result()
-            diar_segments = diarize_future.result()
+        words = transcribe(preprocessed_path, _whisper_model)
+        logger.info(f"[{job_id}] Transcribe: {time.time()-t0:.1f}s → {len(words)} words")
 
-        logger.info(f"[{job_id}] Transcribe+Diarize (parallel): {time.time()-t0:.1f}s → {len(words)} words, {len(diar_segments)} segments")
+        # 4. Diarize with NeMo (GPU, PyTorch)
+        # NOTE: Sequential after transcribe to avoid CUDA context conflicts between
+        # CTranslate2 (faster-whisper) and PyTorch (NeMo) in concurrent threads.
+        t0 = time.time()
+        diar_segments = diarize(preprocessed_path, num_speakers=num_speakers, job_id=job_id)
+        logger.info(f"[{job_id}] Diarize: {time.time()-t0:.1f}s → {len(diar_segments)} segments")
 
-        # 5. Merge words + speaker segments into utterances
+        # 5. Merge
         utterances = merge(words, diar_segments)
 
         # 6. Build output
@@ -114,12 +107,7 @@ def handler(job: dict) -> dict:
 
         return {
             "utterances": [
-                {
-                    "speaker": u["speaker"],
-                    "start": u["start"],
-                    "end": u["end"],
-                    "text": u["text"],
-                }
+                {"speaker": u["speaker"], "start": u["start"], "end": u["end"], "text": u["text"]}
                 for u in utterances
             ],
             "words": word_speaker_map,
@@ -130,8 +118,11 @@ def handler(job: dict) -> dict:
         }
 
     except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
         logger.exception(f"[{job_id}] Job failed: {e}")
-        return {"error": str(e), "audio_url": audio_url}
+        # Include traceback in output so RunPod shows it in job details
+        return {"error": str(e), "traceback": tb, "audio_url": audio_url}
 
     finally:
         for path in [downloaded_path, preprocessed_path]:
@@ -143,7 +134,6 @@ def handler(job: dict) -> dict:
 
 
 def _download_audio(url: str, job_id: str) -> str:
-    """Download audio from URL to /tmp/, preserving original filename."""
     parsed = urlparse(url)
     original_name = os.path.basename(parsed.path) or "audio"
     safe_name = "".join(c for c in original_name if c.isalnum() or c in "._-")
@@ -167,19 +157,12 @@ def _download_audio(url: str, job_id: str) -> str:
 
 
 def _build_word_speaker_map(words: list[dict], utterances: list[dict]) -> list[dict]:
-    """Build per-word speaker assignments from utterance groupings."""
     result = []
     for utt in utterances:
         for w in utt.get("words", []):
-            result.append({
-                "word": w["word"],
-                "start": w["start"],
-                "end": w["end"],
-                "speaker": utt["speaker"],
-            })
+            result.append({"word": w["word"], "start": w["start"], "end": w["end"], "speaker": utt["speaker"]})
     result.sort(key=lambda w: w["start"])
     return result
 
 
-# Start RunPod serverless
 runpod.serverless.start({"handler": handler})

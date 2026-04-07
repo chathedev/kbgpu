@@ -94,8 +94,15 @@ def _run_demucs(wav_path: str) -> str:
 
     # Resample back to 16kHz if needed
     if model.samplerate != TARGET_SR:
-        import librosa
-        vocals = librosa.resample(vocals, orig_sr=model.samplerate, target_sr=TARGET_SR)
+        import subprocess, tempfile
+        tmp_in = tempfile.mktemp(suffix=".wav")
+        import soundfile as _sf
+        _sf.write(tmp_in, vocals, model.samplerate)
+        tmp_out = tempfile.mktemp(suffix=".wav")
+        subprocess.run(["ffmpeg", "-y", "-i", tmp_in, "-ar", str(TARGET_SR), tmp_out], check=True, capture_output=True)
+        vocals, _ = _sf.read(tmp_out, dtype="float32")
+        os.unlink(tmp_in)
+        os.unlink(tmp_out)
 
     # Normalize
     peak = abs(vocals).max()

@@ -70,9 +70,9 @@ def _build_diarizer_config(tmp_dir: str, manifest_path: str, num_speakers: Optio
     from omegaconf import OmegaConf
 
     cfg_dict = {
-        "num_workers": 4,
+        "num_workers": 0,
         "sample_rate": 16000,
-        "batch_size": 128,
+        "batch_size": 64,
         "device": "cuda",
         "verbose": False,
         "diarizer": {
