@@ -1,9 +1,7 @@
 import os
 import logging
+import subprocess
 import tempfile
-import numpy as np
-import soundfile as sf
-import librosa
 
 logger = logging.getLogger(__name__)
 
@@ -16,60 +14,57 @@ ENABLE_DEMUCS = os.environ.get("ENABLE_DEMUCS", "0").strip() == "1"
 
 def preprocess_audio(input_path: str) -> str:
     """
-    Load audio, optionally run Demucs vocal separation, resample to 16kHz mono WAV.
-    ENABLE_DEMUCS=1 to enable Demucs (off by default for meeting recordings).
-    Returns path to cleaned WAV file.
+    Convert audio to 16kHz mono WAV using ffmpeg.
+
+    Replaces the old librosa.load approach which took 60-90s on CPU for
+    large m4a files. ffmpeg decodes and resamples in ~5s regardless of
+    input format or file size.
+
+    Returns path to 16kHz mono PCM WAV file.
     """
-    logger.info(f"Preprocessing audio: {input_path} (demucs={ENABLE_DEMUCS})")
-
-    # Load audio with librosa - handles any format ffmpeg can decode
-    audio, sr = librosa.load(input_path, sr=None, mono=False)
-
-    # Ensure 2D shape: (channels, samples)
-    if audio.ndim == 1:
-        audio = audio[np.newaxis, :]
-
-    duration = audio.shape[-1] / sr
-    logger.info(f"Audio loaded: {duration:.1f}s, {audio.shape[0]}ch, {sr}Hz")
-
-    if ENABLE_DEMUCS:
-        try:
-            audio = _run_demucs(audio, sr)
-            logger.info("Demucs separation successful")
-        except Exception as e:
-            logger.warning(f"Demucs failed, falling back to raw audio: {e}")
-
-    # Mix to mono
-    if audio.ndim > 1 and audio.shape[0] > 1:
-        mono = audio.mean(axis=0)
-    else:
-        mono = audio.squeeze()
-
-    # Resample to 16kHz
-    if sr != TARGET_SR:
-        mono = librosa.resample(mono, orig_sr=sr, target_sr=TARGET_SR)
-        logger.info(f"Resampled from {sr}Hz to {TARGET_SR}Hz")
-
-    # Normalize to prevent clipping
-    peak = np.abs(mono).max()
-    if peak > 0:
-        mono = mono / peak * 0.95
-
-    # Save to temp WAV
     fd, out_path = tempfile.mkstemp(suffix=".wav", dir="/tmp")
     os.close(fd)
-    sf.write(out_path, mono.astype(np.float32), TARGET_SR, subtype="PCM_16")
-    logger.info(f"Preprocessed audio saved: {out_path} ({len(mono)/TARGET_SR:.1f}s)")
+
+    logger.info(f"Preprocessing: {input_path} (demucs={ENABLE_DEMUCS})")
+
+    # Fast path: ffmpeg handles any container/codec directly
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", input_path,
+        "-ar", str(TARGET_SR),
+        "-ac", "1",
+        "-sample_fmt", "s16",
+        "-acodec", "pcm_s16le",
+        out_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, timeout=300)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"ffmpeg preprocessing failed (exit {result.returncode}): "
+            f"{result.stderr.decode(errors='replace')}"
+        )
+
+    size_mb = os.path.getsize(out_path) / (1024 * 1024)
+    logger.info(f"Preprocessed: {out_path} ({size_mb:.1f}MB)")
+
+    # Optional Demucs vocal separation (default OFF — adds 2-3 min for no benefit on meetings)
+    if ENABLE_DEMUCS:
+        try:
+            out_path = _run_demucs(out_path)
+            logger.info("Demucs separation successful")
+        except Exception as e:
+            logger.warning(f"Demucs failed, using raw audio: {e}")
 
     return out_path
 
 
-def _run_demucs(audio: np.ndarray, sr: int) -> np.ndarray:
+def _run_demucs(wav_path: str) -> str:
     """
-    Run Demucs htdemucs to extract vocals.
-    audio: (channels, samples) float32 numpy array
-    Returns: (channels, samples) vocals numpy array
+    Run Demucs htdemucs on an already-converted 16kHz mono WAV.
+    Returns path to vocals-only WAV (same directory).
     """
+    import numpy as np
+    import soundfile as sf
     import torch
     import demucs.pretrained
     import demucs.apply
@@ -78,14 +73,14 @@ def _run_demucs(audio: np.ndarray, sr: int) -> np.ndarray:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logger.info(f"Running Demucs on {device}")
 
+    audio, sr = sf.read(wav_path, dtype="float32")
+    if audio.ndim == 1:
+        audio = audio[None, :]  # (1, T)
+    wav = torch.from_numpy(audio).float().unsqueeze(0)  # (1, C, T)
+
     model = demucs.pretrained.get_model("htdemucs")
     model.to(device)
     model.eval()
-
-    wav = torch.from_numpy(audio).float()
-    if wav.ndim == 1:
-        wav = wav.unsqueeze(0)
-    wav = wav.unsqueeze(0)
 
     wav = convert_audio(wav, sr, model.samplerate, model.audio_channels)
 
@@ -94,15 +89,19 @@ def _run_demucs(audio: np.ndarray, sr: int) -> np.ndarray:
             model, wav, device=device, shifts=1, split=True, overlap=0.25, progress=False
         )
 
-    source_names = model.sources
-    vocals_idx = source_names.index("vocals")
-    vocals = sources[0, vocals_idx]
+    vocals_idx = model.sources.index("vocals")
+    vocals = sources[0, vocals_idx].mean(dim=0).cpu().numpy()  # mono
 
-    if model.samplerate != sr:
-        vocals_np = vocals.cpu().numpy()
-        return np.stack([
-            librosa.resample(vocals_np[c], orig_sr=model.samplerate, target_sr=sr)
-            for c in range(vocals_np.shape[0])
-        ])
+    # Resample back to 16kHz if needed
+    if model.samplerate != TARGET_SR:
+        import librosa
+        vocals = librosa.resample(vocals, orig_sr=model.samplerate, target_sr=TARGET_SR)
 
-    return vocals.cpu().numpy()
+    # Normalize
+    peak = abs(vocals).max()
+    if peak > 0:
+        vocals = vocals / peak * 0.95
+
+    # Overwrite the existing wav
+    sf.write(wav_path, vocals.astype("float32"), TARGET_SR, subtype="PCM_16")
+    return wav_path

@@ -8,8 +8,11 @@ logger = logging.getLogger(__name__)
 
 MSDD_MODEL_PATH = "/models/nemo/diar_msdd.nemo"
 TITANET_MODEL_PATH = "/models/nemo/titanet-large.nemo"
+VAD_MODEL_PATH = "/models/nemo/vad_multilingual_marblenet.nemo"
 
 _MSDD_AVAILABLE = os.path.exists(MSDD_MODEL_PATH)
+# Use pre-baked VAD if available; otherwise NeMo downloads from NGC at runtime
+_VAD_MODEL = VAD_MODEL_PATH if os.path.exists(VAD_MODEL_PATH) else "vad_multilingual_marblenet"
 
 
 def diarize(audio_path: str, num_speakers: Optional[int] = None, job_id: Optional[str] = None) -> list[dict]:
@@ -67,9 +70,9 @@ def _build_diarizer_config(tmp_dir: str, manifest_path: str, num_speakers: Optio
     from omegaconf import OmegaConf
 
     cfg_dict = {
-        "num_workers": 1,
+        "num_workers": 4,
         "sample_rate": 16000,
-        "batch_size": 64,
+        "batch_size": 128,
         "device": "cuda",
         "verbose": False,
         "diarizer": {
@@ -79,7 +82,7 @@ def _build_diarizer_config(tmp_dir: str, manifest_path: str, num_speakers: Optio
             "collar": 0.25,
             "ignore_overlap": False,
             "vad": {
-                "model_path": "vad_multilingual_marblenet",
+                "model_path": _VAD_MODEL,
                 "external_vad_manifest": None,
                 "parameters": {
                     "window_length_in_sec": 0.15,

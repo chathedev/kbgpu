@@ -4,6 +4,8 @@ import logging
 import tempfile
 import requests
 import runpod
+import soundfile as sf
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
 
 # Configure logging
@@ -64,32 +66,44 @@ def handler(job: dict) -> dict:
 
     try:
         # 1. Download audio
+        t0 = time.time()
         downloaded_path = _download_audio(audio_url, job_id)
+        logger.info(f"[{job_id}] Download: {time.time()-t0:.1f}s")
 
-        # 2. Preprocess: vocal separation + resample to 16kHz mono
+        # 2. Preprocess: ffmpeg → 16kHz mono WAV (fast, ~5s)
+        t0 = time.time()
         preprocessed_path = preprocess_audio(downloaded_path)
+        logger.info(f"[{job_id}] Preprocess: {time.time()-t0:.1f}s")
 
-        # 3. Transcribe with KB-Whisper-large
-        words = transcribe(preprocessed_path, _whisper_model)
+        # Get duration from preprocessed WAV before spawning threads
+        with sf.SoundFile(preprocessed_path) as f:
+            duration_seconds = round(len(f) / f.samplerate, 2)
+        logger.info(f"[{job_id}] Audio duration: {duration_seconds:.1f}s")
 
-        # 4. Diarize with NeMo MSDD
-        diar_segments = diarize(preprocessed_path, num_speakers=num_speakers, job_id=job_id)
+        # 3+4. Transcribe + Diarize in PARALLEL on the same A6000
+        #   - KB-Whisper (CTranslate2 float16) uses CUDA stream
+        #   - NeMo TitaNet+VAD uses PyTorch CUDA
+        #   - Both release the GIL during CUDA ops → true parallelism
+        #   - A6000 has 48GB VRAM, both models fit easily (~3GB + ~2GB)
+        t0 = time.time()
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            transcribe_future = executor.submit(transcribe, preprocessed_path, _whisper_model)
+            diarize_future = executor.submit(
+                diarize, preprocessed_path, num_speakers=num_speakers, job_id=job_id
+            )
+            # Collect results — re-raise any exception from the threads
+            words = transcribe_future.result()
+            diar_segments = diarize_future.result()
+
+        logger.info(f"[{job_id}] Transcribe+Diarize (parallel): {time.time()-t0:.1f}s → {len(words)} words, {len(diar_segments)} segments")
 
         # 5. Merge words + speaker segments into utterances
         utterances = merge(words, diar_segments)
 
         # 6. Build output
         processing_time = round(time.time() - start_time, 2)
-
-        # Get audio duration from preprocessed file
-        import soundfile as sf
-        with sf.SoundFile(preprocessed_path) as f:
-            duration_seconds = round(len(f) / f.samplerate, 2)
-
         unique_speakers = list({u["speaker"] for u in utterances})
         num_speakers_detected = len(unique_speakers)
-
-        # Build word-level output with speaker assignments
         word_speaker_map = _build_word_speaker_map(words, utterances)
 
         logger.info(
@@ -120,7 +134,6 @@ def handler(job: dict) -> dict:
         return {"error": str(e), "audio_url": audio_url}
 
     finally:
-        # Always clean up temp files
         for path in [downloaded_path, preprocessed_path]:
             if path and os.path.exists(path):
                 try:
@@ -133,7 +146,6 @@ def _download_audio(url: str, job_id: str) -> str:
     """Download audio from URL to /tmp/, preserving original filename."""
     parsed = urlparse(url)
     original_name = os.path.basename(parsed.path) or "audio"
-    # Sanitize filename
     safe_name = "".join(c for c in original_name if c.isalnum() or c in "._-")
     if not safe_name:
         safe_name = "audio"
@@ -145,7 +157,7 @@ def _download_audio(url: str, job_id: str) -> str:
     response.raise_for_status()
 
     with open(out_path, "wb") as f:
-        for chunk in response.iter_content(chunk_size=8192):
+        for chunk in response.iter_content(chunk_size=65536):
             if chunk:
                 f.write(chunk)
 
@@ -165,7 +177,6 @@ def _build_word_speaker_map(words: list[dict], utterances: list[dict]) -> list[d
                 "end": w["end"],
                 "speaker": utt["speaker"],
             })
-    # Sort by start time
     result.sort(key=lambda w: w["start"])
     return result
 

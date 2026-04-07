@@ -35,7 +35,20 @@ except Exception as e:
     print(f"TitaNet FAILED: {e}", flush=True)
     sys.exit(1)
 
-# ── 3. MSDD (multi-scale diarization decoder) — optional ─────────────────────
+# ── 3. VAD model (MarbleNet — used by NeMo diarizer) ─────────────────────────
+# Without pre-baking this, every cold-start downloads ~50MB from NGC at job time.
+print("=== Downloading VAD model (vad_multilingual_marblenet) ===", flush=True)
+try:
+    from nemo.collections.asr.models import MarbleNetModel
+    vad = MarbleNetModel.from_pretrained("vad_multilingual_marblenet")
+    vad.save_to("/models/nemo/vad_multilingual_marblenet.nemo")
+    del vad
+    print("VAD model: OK -> /models/nemo/vad_multilingual_marblenet.nemo", flush=True)
+except Exception as e:
+    # Non-fatal: NeMo will fall back to downloading at runtime
+    print(f"VAD model download failed (non-fatal): {e}", flush=True)
+
+# ── 4. MSDD (multi-scale diarization decoder) — optional ─────────────────────
 # NeMo 2.x renamed/restructured MSDD models. Try known names, warn on failure.
 print("=== Downloading MSDD model (optional) ===", flush=True)
 MSDD_CANDIDATES = [
@@ -59,5 +72,3 @@ if not msdd_ok:
     print("MSDD: No model available — diarizer will use clustering-only (still effective)", flush=True)
 
 print("=== All required models downloaded successfully ===", flush=True)
-# Note: Demucs model is NOT pre-downloaded — Demucs is disabled by default.
-# Set ENABLE_DEMUCS=1 and add demucs to requirements-ml.txt to opt in.
