@@ -1,123 +1,174 @@
-"""
-RunPod Serverless — KB-Whisper Large Transcription
-Model loaded at module level for FlashBoot cold-start snapshot.
-Model MUST be pre-downloaded at /models/kb-whisper-large during Docker build.
-"""
 import os
-import sys
 import time
-import base64
+import logging
 import tempfile
+import requests
 import runpod
+from urllib.parse import urlparse
 
-MODEL_PATH = "/models/kb-whisper-large"
-
-# Verify model exists before importing (fail fast with clear error)
-if not os.path.isdir(MODEL_PATH) or len(os.listdir(MODEL_PATH)) < 3:
-    print(f"[FATAL] Model not found at {MODEL_PATH}. Must be baked into Docker image at build time.", flush=True)
-    sys.exit(1)
-
-from faster_whisper import WhisperModel
-
-# ── Load model at module level (FlashBoot snapshots this state) ──────────────
-_t = time.time()
-print(f"[BOOT] Loading KB-Whisper Large from {MODEL_PATH}...", flush=True)
-model = WhisperModel(
-    MODEL_PATH,
-    device="cuda",
-    compute_type="float16",
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
-print(f"[BOOT] Model loaded in {time.time() - _t:.1f}s — worker ready", flush=True)
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Module-level model loading — runs once per warm container, never inside handler
+# ---------------------------------------------------------------------------
+from transcribe import load_whisper_model
+
+logger.info("Loading models...")
+_whisper_model = load_whisper_model()
+logger.info("Models loaded successfully")
+
+# ---------------------------------------------------------------------------
+# Import pipeline modules (after models loaded so logging is set up)
+# ---------------------------------------------------------------------------
+from preprocess import preprocess_audio
+from transcribe import transcribe
+from diarize import diarize
+from merge import merge
 
 
-def handler(job):
-    t0 = time.time()
-    job_input = job["input"]
-    audio_base64 = job_input.get("audio_base64")
+def handler(job: dict) -> dict:
+    """
+    RunPod serverless handler for Swedish meeting transcription.
+
+    Input:
+      audio_url: str         — URL to download audio file
+      num_speakers: int|null — optional speaker count hint
+      job_id: str|null       — optional job ID for logging/temp file naming
+
+    Output:
+      utterances: list of {speaker, start, end, text}
+      words: list of {word, start, end, speaker}
+      num_speakers: int
+      duration_seconds: float
+      processing_time_seconds: float
+      audio_url: str
+    """
+    job_input = job.get("input", {})
     audio_url = job_input.get("audio_url")
-    chunk_index = job_input.get("chunk_index", 0)
-    language = job_input.get("language", "sv")
-    audio_path = None
-    _tmp_path = None
+    num_speakers = job_input.get("num_speakers")
+    job_id = job_input.get("job_id") or job.get("id") or "unknown"
+
+    logger.info(f"[{job_id}] Job received: audio_url={audio_url}, num_speakers={num_speakers}")
+
+    if not audio_url:
+        return {"error": "Missing required field: audio_url", "audio_url": None}
+
+    start_time = time.time()
+    downloaded_path = None
+    preprocessed_path = None
 
     try:
-        t1 = time.time()
-        if audio_base64:
-            # Decode base64 audio to a temp file
-            raw = base64.b64decode(audio_base64)
-            fd, _tmp_path = tempfile.mkstemp(suffix=".wav")
-            with os.fdopen(fd, "wb") as f:
-                f.write(raw)
-            audio_path = _tmp_path
-            print(f"[chunk {chunk_index}] Decoded base64 ({len(raw)} bytes) in {time.time() - t1:.2f}s", flush=True)
-        elif audio_url:
-            import requests as _req
-            resp = _req.get(audio_url, timeout=30)
-            resp.raise_for_status()
-            fd, _tmp_path = tempfile.mkstemp(suffix=".wav")
-            with os.fdopen(fd, "wb") as f:
-                f.write(resp.content)
-            audio_path = _tmp_path
-            print(f"[chunk {chunk_index}] Downloaded ({len(resp.content)} bytes) in {time.time() - t1:.2f}s", flush=True)
-        else:
-            return {"error": "audio_base64 or audio_url required", "chunk_index": chunk_index}
+        # 1. Download audio
+        downloaded_path = _download_audio(audio_url, job_id)
 
-        # Transcribe
-        t2 = time.time()
-        segments_gen, info = model.transcribe(
-            audio_path,
-            language=language if language else None,
-            condition_on_previous_text=False,
-            word_timestamps=True,
-            beam_size=5,
-            vad_filter=True,
-            vad_parameters={"min_silence_duration_ms": 500},
+        # 2. Preprocess: vocal separation + resample to 16kHz mono
+        preprocessed_path = preprocess_audio(downloaded_path)
+
+        # 3. Transcribe with KB-Whisper-large
+        words = transcribe(preprocessed_path, _whisper_model)
+
+        # 4. Diarize with NeMo MSDD
+        diar_segments = diarize(preprocessed_path, num_speakers=num_speakers, job_id=job_id)
+
+        # 5. Merge words + speaker segments into utterances
+        utterances = merge(words, diar_segments)
+
+        # 6. Build output
+        processing_time = round(time.time() - start_time, 2)
+
+        # Get audio duration from preprocessed file
+        import soundfile as sf
+        with sf.SoundFile(preprocessed_path) as f:
+            duration_seconds = round(len(f) / f.samplerate, 2)
+
+        unique_speakers = list({u["speaker"] for u in utterances})
+        num_speakers_detected = len(unique_speakers)
+
+        # Build word-level output with speaker assignments
+        word_speaker_map = _build_word_speaker_map(words, utterances)
+
+        logger.info(
+            f"[{job_id}] Done in {processing_time}s: "
+            f"{len(utterances)} utterances, {num_speakers_detected} speakers, "
+            f"{duration_seconds}s audio"
         )
 
-        segments = []
-        words = []
-        full_text_parts = []
-        for seg in segments_gen:
-            text = seg.text.strip()
-            segments.append({
-                "text": text,
-                "start": round(seg.start, 3),
-                "end": round(seg.end, 3),
-            })
-            full_text_parts.append(text)
-            if seg.words:
-                for w in seg.words:
-                    words.append({
-                        "word": w.word.strip(),
-                        "start": round(w.start, 3),
-                        "end": round(w.end, 3),
-                        "probability": round(w.probability, 3) if hasattr(w, "probability") else None,
-                    })
-
-        elapsed = time.time() - t2
-        print(f"[chunk {chunk_index}] Transcribed in {elapsed:.2f}s — {len(segments)} segs, {len(words)} words, total {time.time() - t0:.2f}s", flush=True)
-
         return {
-            "chunk_index": chunk_index,
-            "text": " ".join(full_text_parts),
-            "segments": segments,
-            "words": words,
-            "language": info.language,
-            "language_probability": round(info.language_probability, 3) if info.language_probability else None,
-            "duration_sec": round(info.duration, 3) if info.duration else None,
-            "transcribe_time_sec": round(elapsed, 3),
+            "utterances": [
+                {
+                    "speaker": u["speaker"],
+                    "start": u["start"],
+                    "end": u["end"],
+                    "text": u["text"],
+                }
+                for u in utterances
+            ],
+            "words": word_speaker_map,
+            "num_speakers": num_speakers_detected,
+            "duration_seconds": duration_seconds,
+            "processing_time_seconds": processing_time,
+            "audio_url": audio_url,
         }
 
     except Exception as e:
-        print(f"[chunk {chunk_index}] ERROR: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
-        return {"error": str(e), "chunk_index": chunk_index}
+        logger.exception(f"[{job_id}] Job failed: {e}")
+        return {"error": str(e), "audio_url": audio_url}
 
     finally:
-        if _tmp_path and os.path.exists(_tmp_path):
-            try:
-                os.unlink(_tmp_path)
-            except OSError:
-                pass
+        # Always clean up temp files
+        for path in [downloaded_path, preprocessed_path]:
+            if path and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
 
 
+def _download_audio(url: str, job_id: str) -> str:
+    """Download audio from URL to /tmp/, preserving original filename."""
+    parsed = urlparse(url)
+    original_name = os.path.basename(parsed.path) or "audio"
+    # Sanitize filename
+    safe_name = "".join(c for c in original_name if c.isalnum() or c in "._-")
+    if not safe_name:
+        safe_name = "audio"
+
+    out_path = f"/tmp/{job_id}_{safe_name}"
+    logger.info(f"Downloading audio from {url} -> {out_path}")
+
+    response = requests.get(url, stream=True, timeout=300)
+    response.raise_for_status()
+
+    with open(out_path, "wb") as f:
+        for chunk in response.iter_content(chunk_size=8192):
+            if chunk:
+                f.write(chunk)
+
+    size_mb = os.path.getsize(out_path) / (1024 * 1024)
+    logger.info(f"Downloaded {size_mb:.1f}MB: {out_path}")
+    return out_path
+
+
+def _build_word_speaker_map(words: list[dict], utterances: list[dict]) -> list[dict]:
+    """Build per-word speaker assignments from utterance groupings."""
+    result = []
+    for utt in utterances:
+        for w in utt.get("words", []):
+            result.append({
+                "word": w["word"],
+                "start": w["start"],
+                "end": w["end"],
+                "speaker": utt["speaker"],
+            })
+    # Sort by start time
+    result.sort(key=lambda w: w["start"])
+    return result
+
+
+# Start RunPod serverless
 runpod.serverless.start({"handler": handler})

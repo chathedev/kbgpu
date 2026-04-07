@@ -1,90 +1,125 @@
-# KB-Whisper Large — RunPod Serverless Transcription Worker
+# KB-Whisper Large + NeMo MSDD — RunPod Serverless Pipeline
 
-Transcribes a single audio chunk using [KBLab/kb-whisper-large](https://huggingface.co/KBLab/kb-whisper-large) (Swedish). Returns segment + word-level timestamps. Runs 19 instances in parallel for fast meeting transcription.
+Production Swedish meeting transcription pipeline with speaker diarization.
 
-**FlashBoot optimized**: Model loaded at module level, pre-cached in Docker image at build time. Cold starts < 200ms.
+**Stack:**
+- **ASR**: [KBLab/kb-whisper-large](https://huggingface.co/KBLab/kb-whisper-large) via faster-whisper
+- **Diarization**: NeMo ClusteringDiarizer + MSDD (Multi-Scale Diarization Decoder)
+- **Speaker embeddings**: TitaNet-Large
+- **Preprocessing**: Demucs htdemucs vocal separation → 16kHz mono
 
-## Deploy on RunPod
+All models are baked into the Docker image at build time. Cold starts are fast via FlashBoot.
 
-1. **Serverless → New Endpoint → Deploy from GitHub**
-2. Connect repo: `chathedev/kbgpu`, branch: `main`
-3. Dockerfile path: `Dockerfile` (auto-detected)
-4. GPU: **RTX 4090**
-5. Max Workers: **20**
-6. **Enable FlashBoot** in Endpoint Settings after creation
+---
 
-### How FlashBoot works here
+## RunPod Setup
 
-The model is baked into the Docker image at build time (`builder/fetch_model.py` runs during `docker build`). At runtime, `handler.py` loads it at module level — outside the handler function. FlashBoot snapshots this loaded state. Subsequent cold starts restore the snapshot: zero model download, zero model load.
+1. **Serverless → New Endpoint → Custom Source**
+2. Container image: `ghcr.io/chathedev/kbgpu:latest`
+3. GPU: **48GB** (A40, A6000, or RTX 6000 Ada — High Supply tier)
+4. Max Workers: set based on load (recommend 5–10 for meetings)
+5. **Enable FlashBoot** in Endpoint Settings after creation
 
-```python
-# Module level — FlashBoot snapshots this
-model = WhisperModel("KBLab/kb-whisper-large", device="cuda", compute_type="float16", download_root="/models")
+---
 
-def handler(job):
-    # model already in GPU memory
-    ...
-```
+## Input Schema
 
-## API
-
-**Input:**
 ```json
 {
   "input": {
-    "audio_url": "https://storage.example.com/chunk_0.wav",
-    "chunk_index": 0,
-    "total_chunks": 19
+    "audio_url": "https://example.com/meeting.mp3",
+    "num_speakers": 4,
+    "job_id": "optional-for-logging"
   }
 }
 ```
 
-**Output:**
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `audio_url` | string | Yes | URL to audio file (mp3, wav, m4a, ogg, flac, etc.) |
+| `num_speakers` | int | No | Speaker count hint. Omit for auto-detection (up to 12) |
+| `job_id` | string | No | Identifier for logging and temp file naming |
+
+---
+
+## Output Schema
+
 ```json
 {
-  "chunk_index": 0,
-  "segments": [{ "text": "Hej och välkommen", "start": 0.0, "end": 1.5 }],
+  "utterances": [
+    {
+      "speaker": "Talare 1",
+      "start": 0.24,
+      "end": 4.88,
+      "text": "God morgon allihopa, ska vi börja?"
+    }
+  ],
   "words": [
-    { "word": "Hej", "start": 0.0, "end": 0.3 },
-    { "word": "och", "start": 0.35, "end": 0.5 },
-    { "word": "välkommen", "start": 0.55, "end": 1.5 }
-  ]
+    {
+      "word": "God",
+      "start": 0.24,
+      "end": 0.44,
+      "speaker": "Talare 1"
+    }
+  ],
+  "num_speakers": 3,
+  "duration_seconds": 3612.5,
+  "processing_time_seconds": 187.3,
+  "audio_url": "https://example.com/meeting.mp3"
 }
 ```
 
-## Example: Fire 19 chunks in parallel (Node.js)
-
-```javascript
-const RUNPOD_API_KEY = process.env.RUNPOD_API_KEY;
-const ENDPOINT_ID = "your-endpoint-id";
-
-async function transcribeAllChunks(chunkUrls) {
-  const results = await Promise.all(
-    chunkUrls.map((url, i) =>
-      fetch(`https://api.runpod.ai/v2/${ENDPOINT_ID}/runsync`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${RUNPOD_API_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          input: { audio_url: url, chunk_index: i, total_chunks: chunkUrls.length },
-        }),
-      }).then((r) => r.json())
-    )
-  );
-
-  return results.map((r) => r.output).sort((a, b) => a.chunk_index - b.chunk_index);
+On error:
+```json
+{
+  "error": "description of what went wrong",
+  "audio_url": "https://example.com/meeting.mp3"
 }
 ```
 
-## Repo structure
+---
 
+## Test with curl
+
+```bash
+# Submit job
+curl -X POST https://api.runpod.io/v2/<ENDPOINT_ID>/run \
+  -H "Authorization: Bearer $RUNPOD_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "input": {
+      "audio_url": "https://example.com/meeting.mp3",
+      "num_speakers": 4
+    }
+  }'
+
+# Poll for result (use job ID from above response)
+curl https://api.runpod.io/v2/<ENDPOINT_ID>/status/<JOB_ID> \
+  -H "Authorization: Bearer $RUNPOD_API_KEY"
 ```
-├── Dockerfile              # CUDA 12.3 + cuDNN 9, installs deps, pre-caches model
-├── builder/fetch_model.py  # Downloads KB-Whisper at build time
-├── handler.py              # RunPod handler, model at module level
-├── requirements.txt        # Pinned deps
-├── runpod.toml             # RunPod project config
-└── test_input.json         # Local testing
+
+---
+
+## Build & Push
+
+```bash
+chmod +x build_and_push.sh
+./build_and_push.sh
 ```
+
+Requires Docker with `buildx` and push access to `ghcr.io/chathedev/kbgpu`.
+
+---
+
+## Pipeline Details
+
+1. **Download** — Audio fetched from `audio_url` to `/tmp/`
+2. **Preprocess** — Demucs htdemucs extracts vocal stem → resampled to 16kHz mono WAV (falls back to raw audio if separation fails)
+3. **Transcribe** — KB-Whisper-large with `language=sv`, word timestamps, VAD filter, beam_size=5
+4. **Diarize** — NeMo MarbleNet VAD → TitaNet-Large embeddings → MSDD overlap-aware clustering
+5. **Merge** — Words assigned to speakers by maximum time overlap; consecutive same-speaker words grouped into utterances; short utterances merged into neighbors
+6. **Cleanup** — All `/tmp/` files deleted after every job
+
+Speaker labels are in Swedish: **Talare 1**, **Talare 2**, etc., numbered by order of first appearance.
+
+Handles files up to 3+ hours. All GPU inference runs in float16.

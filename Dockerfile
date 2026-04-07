@@ -1,32 +1,68 @@
-FROM runpod/base:0.6.2-cuda12.1.0
+FROM nvidia/cuda:12.1.0-cudnn8-runtime-ubuntu22.04
 
-ENV HF_HOME=/models
-ENV TRANSFORMERS_CACHE=/models
-ENV HF_DATASETS_CACHE=/models
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
 
-WORKDIR /
+# System dependencies
+RUN apt-get update && apt-get install -y \
+    python3.10 \
+    python3.10-dev \
+    python3-pip \
+    ffmpeg \
+    git \
+    wget \
+    curl \
+    libsndfile1 \
+    sox \
+    && rm -rf /var/lib/apt/lists/*
 
-# Ensure python -> python3 symlink
-RUN ln -sf $(which python3) /usr/bin/python 2>/dev/null || true
+# Make python3.10 the default
+RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1 \
+    && update-alternatives --install /usr/bin/python python3 /usr/bin/python3.10 1
 
-# ffmpeg
-RUN apt-get update -y && \
-    apt-get install --yes --no-install-recommends ffmpeg && \
-    apt-get clean -y && rm -rf /var/lib/apt/lists/*
+# Upgrade pip
+RUN python3 -m pip install --upgrade pip setuptools wheel
 
-# Python deps
-COPY requirements.txt /requirements.txt
-RUN python3 -m pip install --upgrade pip && \
-    python3 -m pip install --no-cache-dir -r /requirements.txt
+WORKDIR /app
 
-# Download model at BUILD TIME — baked into image for instant worker starts
-RUN python3 -c "from huggingface_hub import snapshot_download; snapshot_download('KBLab/kb-whisper-large', local_dir='/models/kb-whisper-large', ignore_patterns=['*.msgpack','*.h5','flax_model*','tf_model*','onnx/*'])"
+# Copy requirements first for better layer caching
+COPY requirements.txt .
 
-# Verify model files exist
-RUN ls -la /models/kb-whisper-large/ && python3 -c "import os; files=os.listdir('/models/kb-whisper-large'); print(f'Model files: {len(files)}'); assert len(files)>3, 'Model download incomplete'"
+# Install PyTorch first (specific CUDA version)
+RUN pip install torch>=2.2.0 torchaudio>=2.2.0 --index-url https://download.pytorch.org/whl/cu121
 
-# Copy handler
-COPY handler.py /handler.py
-COPY test_input.json /test_input.json
+# Install remaining requirements
+RUN pip install --no-cache-dir -r requirements.txt
 
-CMD ["python3", "-u", "/handler.py"]
+# Pre-download KB-Whisper-large at build time for fast cold starts
+RUN python3 -c "\
+from faster_whisper import WhisperModel; \
+print('Downloading KB-Whisper-large...'); \
+WhisperModel('KBLab/kb-whisper-large', device='cpu', compute_type='int8', download_root='/models/whisper'); \
+print('KB-Whisper-large downloaded successfully')"
+
+# Pre-download NeMo diarization models from NGC
+RUN mkdir -p /models/nemo && \
+    wget -q -O /models/nemo/diar_msdd_telephony.nemo \
+        "https://api.ngc.nvidia.com/v2/models/nvidia/nemo/diar_msdd_telephony/versions/1.0.1/files/diar_msdd_telephony.nemo" && \
+    echo "MSDD telephony model downloaded" && \
+    wget -q -O /models/nemo/titanet-large.nemo \
+        "https://api.ngc.nvidia.com/v2/models/nvidia/nemo/titanet_large/versions/v1/files/titanet-large.nemo" && \
+    echo "TitaNet-large downloaded"
+
+# Pre-download Demucs htdemucs model
+RUN python3 -c "\
+import demucs.pretrained; \
+print('Downloading Demucs htdemucs...'); \
+demucs.pretrained.get_model('htdemucs'); \
+print('Demucs htdemucs downloaded successfully')"
+
+# Copy application code
+COPY handler.py .
+COPY transcribe.py .
+COPY diarize.py .
+COPY merge.py .
+COPY preprocess.py .
+
+CMD ["python3", "-u", "handler.py"]

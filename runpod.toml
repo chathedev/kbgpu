@@ -1,7 +1,0 @@
-[project]
-name = "tivly-transcription"
-
-[project.env_vars]
-HF_HOME = "/models"
-TRANSFORMERS_CACHE = "/models"
-HF_DATASETS_CACHE = "/models"
