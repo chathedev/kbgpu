@@ -1,0 +1,10 @@
+# Heavy ML dependencies — installed as a separate layer so they're cached
+# independently of light runtime deps (requirements.txt).
+# torch and torchaudio are installed separately (CUDA build from pytorch.org).
+faster-whisper>=1.0.3
+nemo_toolkit[asr]>=1.23.0
+numpy>=1.24.0
+soundfile>=0.12.1
+librosa>=0.10.1
+omegaconf>=2.3.0
+hydra-core>=1.3.2

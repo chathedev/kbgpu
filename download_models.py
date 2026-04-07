@@ -58,14 +58,6 @@ for model_name in MSDD_CANDIDATES:
 if not msdd_ok:
     print("MSDD: No model available — diarizer will use clustering-only (still effective)", flush=True)
 
-# ── 4. Demucs htdemucs (vocal separation) ────────────────────────────────────
-print("=== Downloading Demucs htdemucs ===", flush=True)
-try:
-    from demucs.pretrained import get_model
-    get_model("htdemucs")
-    print("Demucs htdemucs: OK", flush=True)
-except Exception as e:
-    print(f"Demucs FAILED: {e}", flush=True)
-    sys.exit(1)
-
 print("=== All required models downloaded successfully ===", flush=True)
+# Note: Demucs model is NOT pre-downloaded — Demucs is disabled by default.
+# Set ENABLE_DEMUCS=1 and add demucs to requirements-ml.txt to opt in.
