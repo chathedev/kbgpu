@@ -1,9 +1,8 @@
 runpod>=1.6.0
 faster-whisper>=1.0.3
-torch>=2.2.0
-torchaudio>=2.2.0
 nemo_toolkit[asr]>=1.23.0
 demucs>=4.0.1
+julius>=0.2.7
 numpy>=1.24.0
 soundfile>=0.12.1
 librosa>=0.10.1

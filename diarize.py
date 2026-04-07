@@ -79,12 +79,18 @@ def _build_diarizer_config(tmp_dir: str, manifest_path: str, num_speakers: Optio
                 "model_path": "vad_multilingual_marblenet",
                 "external_vad_manifest": None,
                 "parameters": {
+                    # Frame-level VAD params (required by NeMo's VAD runner)
+                    "window_length_in_sec": 0.15,
+                    "shift_length_in_sec": 0.01,
+                    "smoothing": "median",
+                    "overlap": 0.5,
+                    # Threshold / padding
                     "onset": 0.8,
                     "offset": 0.6,
                     "pad_onset": 0.1,
-                    "pad_offset": 0.1,
+                    "pad_offset": -0.1,
                     "min_duration_on": 0.2,
-                    "min_duration_off": 0.25,
+                    "min_duration_off": 0.2,
                     "filter_speech_first": True,
                 },
             },

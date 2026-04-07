@@ -26,47 +26,23 @@ RUN python3 -m pip install --upgrade pip setuptools wheel
 
 WORKDIR /app
 
-# Copy requirements first for better layer caching
+# Install PyTorch with CUDA 12.1 support FIRST (must come before nemo_toolkit
+# so the CUDA build is not overwritten by a CPU build from PyPI)
+RUN pip install --no-cache-dir \
+    "torch>=2.2.0" \
+    "torchaudio>=2.2.0" \
+    --index-url https://download.pytorch.org/whl/cu121
+
+# Copy and install remaining requirements
+# torch/torchaudio intentionally excluded from requirements.txt to avoid
+# pip pulling the CPU build from PyPI on top of the CUDA build above
 COPY requirements.txt .
-
-# Install PyTorch first (specific CUDA version)
-RUN pip install torch>=2.2.0 torchaudio>=2.2.0 --index-url https://download.pytorch.org/whl/cu121
-
-# Install remaining requirements
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Pre-download KB-Whisper-large at build time for fast cold starts
-RUN python3 -c "\
-from faster_whisper import WhisperModel; \
-print('Downloading KB-Whisper-large...'); \
-WhisperModel('KBLab/kb-whisper-large', device='cpu', compute_type='int8', download_root='/models/whisper'); \
-print('KB-Whisper-large downloaded successfully')"
-
-# Pre-download NeMo diarization models via Python API (NGC wget requires auth tokens)
-# EncDecSpeakerLabelModel = TitaNet (speaker embeddings)
-# EncDecDiarLabelModel    = MSDD multi-scale diarizer
-RUN mkdir -p /models/nemo && python3 -c "\
-import os; \
-os.makedirs('/models/nemo', exist_ok=True); \
-from nemo.collections.asr.models import EncDecSpeakerLabelModel, EncDecDiarLabelModel; \
-print('Downloading TitaNet Large...'); \
-titanet = EncDecSpeakerLabelModel.from_pretrained('nvidia/speakerverification_en_titanet_large'); \
-titanet.save_to('/models/nemo/titanet-large.nemo'); \
-print('TitaNet saved to /models/nemo/titanet-large.nemo'); \
-del titanet; \
-print('Downloading MSDD telephony...'); \
-msdd = EncDecDiarLabelModel.from_pretrained('diar_msdd_telephony'); \
-msdd.save_to('/models/nemo/diar_msdd_telephony.nemo'); \
-print('MSDD saved to /models/nemo/diar_msdd_telephony.nemo'); \
-del msdd; \
-print('All NeMo models downloaded')"
-
-# Pre-download Demucs htdemucs model
-RUN python3 -c "\
-import demucs.pretrained; \
-print('Downloading Demucs htdemucs...'); \
-demucs.pretrained.get_model('htdemucs'); \
-print('Demucs htdemucs downloaded successfully')"
+# Copy model download script and run it
+# Separate file (not inline -c) so errors show the exact line that failed
+COPY download_models.py .
+RUN python3 download_models.py
 
 # Copy application code
 COPY handler.py .
