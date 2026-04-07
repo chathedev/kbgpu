@@ -1,6 +1,8 @@
 # Heavy ML dependencies — installed as a separate layer so they're cached
 # independently of light runtime deps (requirements.txt).
-# torch and torchaudio are installed separately (CUDA build from pytorch.org).
+# torch (CUDA) is installed separately; torchaudio is installed from PyPI here
+# so the CPU wheel is used — it dlopen-succeeds on GHA's CPU-only build runners.
+torchaudio>=2.2.0
 faster-whisper>=1.0.3
 nemo_toolkit[asr]>=1.23.0
 numpy>=1.24.0

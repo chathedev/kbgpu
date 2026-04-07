@@ -40,12 +40,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install --upgrade pip setuptools wheel
 
-# ── 2. PyTorch with CUDA 12.1 ────────────────────────────────────────────────
-# Must be installed before nemo_toolkit so the CUDA build isn't overwritten.
+# ── 2. PyTorch (CUDA) ────────────────────────────────────────────────────────
+# Install ONLY torch CUDA here. torchaudio is intentionally NOT installed
+# from pytorch.org — the CUDA torchaudio wheel links against libcuda.so which
+# doesn't exist on GHA's CPU-only build runners, causing dlopen to fail during
+# `download_models.py`. We let nemo_toolkit pull its own compatible torchaudio
+# from PyPI (a CPU wheel that dlopen-succeeds everywhere). The CUDA torch is
+# all that's needed for GPU tensor ops; torchaudio CPU handles audio I/O fine.
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install \
     "torch>=2.2.0" \
-    "torchaudio>=2.2.0" \
     --index-url https://download.pytorch.org/whl/cu121
 
 # ── 3. Heavy ML libraries ─────────────────────────────────────────────────────
