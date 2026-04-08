@@ -28,8 +28,19 @@ from merge import merge
 logger.info("=== kbgpu startup: loading models into GPU VRAM ===")
 _t0 = time.time()
 
+# Whisper is fast & always works — any crash here is catastrophic, let it raise.
 _whisper_model = load_whisper_model()           # CTranslate2 float16 on CUDA
-_diar_models = load_diarization_models()        # pyannote community-1 on CUDA
+
+# Pyannote load is more fragile (HF download, CUDA ops, model-config version
+# checks). If it fails, keep the worker alive and surface the error PER JOB
+# rather than crash-looping silently (shows as "throttled" in RunPod health).
+_diar_models = None
+_diar_load_error = None
+try:
+    _diar_models = load_diarization_models()    # pyannote community-1 on CUDA
+except Exception as e:
+    _diar_load_error = f"{type(e).__name__}: {e}"
+    logger.exception(f"Diarization model load FAILED at startup: {_diar_load_error}")
 
 logger.info(f"=== Models loaded in {time.time()-_t0:.1f}s — running GPU warmup ===")
 
@@ -51,10 +62,11 @@ def _warmup():
         transcribe(path, _whisper_model)
     except Exception as e:
         logger.warning(f"warmup: whisper error (non-fatal): {e}")
-    try:
-        diarize(path, diar_models=_diar_models, num_speakers=1, job_id="warmup")
-    except Exception as e:
-        logger.warning(f"warmup: pyannote error (non-fatal): {e}")
+    if _diar_models is not None:
+        try:
+            diarize(path, diar_models=_diar_models, num_speakers=1, job_id="warmup")
+        except Exception as e:
+            logger.warning(f"warmup: pyannote error (non-fatal): {e}")
     try:
         os.unlink(path)
     except Exception:
@@ -75,6 +87,12 @@ def handler(job: dict) -> dict:
 
     if not audio_url:
         return {"error": "Missing required field: audio_url", "audio_url": None}
+
+    if _diar_models is None:
+        return {
+            "error": f"Diarization model failed to load at startup: {_diar_load_error}",
+            "audio_url": audio_url,
+        }
 
     start_time = time.time()
     downloaded_path = None

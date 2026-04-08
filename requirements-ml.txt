@@ -3,6 +3,7 @@
 # torch+torchaudio (CUDA cu124) are installed by Dockerfile step 2.
 faster-whisper>=1.0.3
 # pyannote.audio — speaker diarization (community-1 model, much faster than NeMo)
-pyannote.audio>=3.3.2
+# pyannote community-1 config requires pyannote.audio 4.0.0+
+pyannote.audio>=4.0.0,<5.0.0
 numpy>=1.24.0
 soundfile>=0.12.1
