@@ -58,6 +58,26 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     --index-url https://download.pytorch.org/whl/cu124 \
     --force-reinstall --no-deps
 
+# ── 3c. Register nvidia CUDA libs from Python packages ────────────────────────
+# NeMo installs nvidia-cuda-runtime-cu13 etc. as Python packages. Their .so files
+# live in site-packages/nvidia/*/lib/ — NOT in the system ld search path.
+# At build time (no GPU on GHA runner), importing NeMo would fail with:
+#   libcudart.so.13: cannot open shared object file: No such file or directory
+# This step adds those paths to ldconfig so dynamic linking works at build time.
+RUN python3 -c "
+import glob, os, site
+paths = []
+for sp in site.getsitepackages():
+    paths.extend(glob.glob(os.path.join(sp, 'nvidia/*/lib')))
+if paths:
+    with open('/etc/ld.so.conf.d/nvidia-pypi.conf', 'w') as f:
+        f.write('\n'.join(paths) + '\n')
+    os.system('ldconfig')
+    print('Registered CUDA lib paths:', len(paths))
+else:
+    print('No nvidia CUDA lib paths found (OK if no cu13 packages)')
+"
+
 # ── 4. Light runtime dependencies ────────────────────────────────────────────
 COPY requirements.txt /tmp/requirements.txt
 RUN --mount=type=cache,target=/root/.cache/pip \

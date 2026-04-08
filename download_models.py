@@ -1,12 +1,20 @@
 """
 Build-time model pre-download script.
 Run once during Docker build; bakes all model weights into the image layer.
+
+Note: CUDA_VISIBLE_DEVICES='' forces CPU-only mode because GHA runners have no GPU.
+NeMo CUDA libs (libcudart.so.13 etc.) must be registered via ldconfig before this
+script runs — see Dockerfile step 3c.
 """
 import os
 import sys
 import json
 import tempfile
 import shutil
+
+# Force CPU-only at build time — GHA runners have no GPU.
+# This prevents NeMo from attempting CUDA device access during model download.
+os.environ['CUDA_VISIBLE_DEVICES'] = ''
 
 os.makedirs("/models/whisper", exist_ok=True)
 os.makedirs("/models/nemo", exist_ok=True)
@@ -30,7 +38,7 @@ except Exception as e:
 print("=== Downloading TitaNet Large ===", flush=True)
 try:
     from nemo.collections.asr.models import EncDecSpeakerLabelModel
-    titanet = EncDecSpeakerLabelModel.from_pretrained("titanet_large")
+    titanet = EncDecSpeakerLabelModel.from_pretrained("titanet_large", map_location="cpu")
     titanet.save_to("/models/nemo/titanet-large.nemo")
     del titanet
     print("TitaNet Large: OK -> /models/nemo/titanet-large.nemo", flush=True)
@@ -53,7 +61,7 @@ for mod_name, cls_name in VAD_CLASSES:
         import importlib
         mod = importlib.import_module(mod_name)
         cls = getattr(mod, cls_name)
-        vad = cls.from_pretrained("vad_multilingual_marblenet")
+        vad = cls.from_pretrained("vad_multilingual_marblenet", map_location="cpu")
         vad.save_to("/models/nemo/vad_multilingual_marblenet.nemo")
         del vad
         print(f"VAD ({cls_name}): OK -> /models/nemo/vad_multilingual_marblenet.nemo", flush=True)
@@ -142,7 +150,7 @@ msdd_ok = False
 for model_name in MSDD_CANDIDATES:
     try:
         from nemo.collections.asr.models import EncDecDiarLabelModel
-        msdd = EncDecDiarLabelModel.from_pretrained(model_name)
+        msdd = EncDecDiarLabelModel.from_pretrained(model_name, map_location="cpu")
         msdd.save_to("/models/nemo/diar_msdd.nemo")
         del msdd
         print(f"MSDD ({model_name}): OK -> /models/nemo/diar_msdd.nemo", flush=True)
