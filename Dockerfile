@@ -5,15 +5,21 @@
 # CUDA version strategy:
 #   RunPod workers have driver 550 = CUDA 12.4.
 #   nemo_toolkit 2.7+ resolves torch 2.11/cu13 which needs driver ≥560 → crash.
-#   Fix: base on cuda:12.4.1 (no cudnn — saves ~600MB vs cudnn variant),
-#   install torch cu124, then force-reinstall after nemo overwrites it.
+#   Fix: base on cuda:12.4.1-cudnn-runtime (system cuDNN avoids all PyPI
+#   cu12/cu13 package conflicts), install torch cu124, then force-reinstall
+#   after nemo overwrites it.
 #
-# Disk budget on GHA free runners: ~14GB.
-#   cuda:12.4.1-runtime-ubuntu22.04 = ~5.5GB compressed
-#   vs cuda:12.4.1-cudnn-runtime = ~7.5GB → runs out of space
+# Why cudnn-runtime base (not just runtime):
+#   - System cuDNN at /usr/lib/x86_64-linux-gnu/libcudnn.so.9 (always in ld path)
+#   - No PyPI nvidia-cudnn-cu12/cu13 namespace conflicts
+#   - torch cu124 finds system cudnn automatically
+#
+# Disk budget on GHA free runners: ~14GB after cleanup step (~20GB).
+#   cuda:12.4.1-cudnn-runtime = ~3.5GB compressed (~8GB uncompressed)
+#   Fits fine with the "Free disk space" step in .github/workflows/build.yml.
 # ─────────────────────────────────────────────────────────────────────────────
 
-FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -40,9 +46,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 # ── 2. PyTorch cu124 ─────────────────────────────────────────────────────────
 # Match RunPod worker driver (550.x = CUDA 12.4).
-# torchaudio NOT from pytorch.org — CUDA wheel dlopen-fails on CPU build runners.
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install "torch>=2.2.0,<2.6.0" \
+    pip install "torch>=2.2.0,<2.6.0" "torchaudio>=2.2.0,<2.6.0" \
     --index-url https://download.pytorch.org/whl/cu124
 
 # ── 3. Heavy ML libraries ─────────────────────────────────────────────────────
@@ -52,42 +57,21 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 # ── 3b. Re-pin torch + torchaudio to cu124 ────────────────────────────────────
 # nemo_toolkit resolves torch 2.11+/cu13 (driver ≥560 required — workers have 550).
-# Force-reinstall cu124 wheels of BOTH torch and torchaudio after nemo.
-# torchaudio must match torch version or we get ABI errors like:
-#   _torchaudio.abi3.so: undefined symbol: aoti_torch_abi_version
-# --no-deps avoids cascading dep changes.
+# Force-reinstall cu124 wheels after nemo overwrites them. --no-deps avoids
+# cascading dep changes but leaves the original cu12 nvidia-* packages from
+# the first torch install intact.
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install "torch>=2.2.0,<2.6.0" "torchaudio>=2.2.0,<2.6.0" \
     --index-url https://download.pytorch.org/whl/cu124 \
     --force-reinstall --no-deps
 
-# ── 3b2. Install cu12 nvidia runtime libs that torch cu124 needs ──────────────
-# Without --no-deps we couldn't add these (pip conflict with NeMo's cu13).
-# Torch cu124 dlopen()s libcudnn/libcublas/etc from site-packages/nvidia/*/lib.
-# Missing these → "cuDNN error: CUDNN_STATUS_NOT_INITIALIZED" at inference time.
+# ── 3c. Purge cu13 nvidia packages (keep cu12 clean) ──────────────────────────
+# NeMo installed nvidia-*-cu13 packages alongside the cu12 ones we need.
+# They share the site-packages/nvidia/*/lib namespace and shadow each other.
+# Remove all cu13 nvidia packages so only cu12 remains. System cuDNN from
+# the base image is at /usr/lib/x86_64-linux-gnu/ (default ld path, not affected).
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip uninstall -y $(pip list --format=freeze 2>/dev/null | grep -oE '^nvidia-[a-z0-9-]+-cu13' || true) || true \
-    && pip install --no-deps \
-    nvidia-cudnn-cu12==9.1.0.70 \
-    nvidia-cublas-cu12 \
-    nvidia-cufft-cu12 \
-    nvidia-curand-cu12 \
-    nvidia-cusolver-cu12 \
-    nvidia-cusparse-cu12 \
-    nvidia-nccl-cu12 \
-    nvidia-nvtx-cu12 \
-    nvidia-cuda-runtime-cu12 \
-    nvidia-cuda-nvrtc-cu12 \
-    nvidia-cuda-cupti-cu12
-
-# ── 3c. Register nvidia CUDA libs from Python packages ────────────────────────
-# NeMo installs nvidia-cuda-runtime-cu13 etc. as Python packages. Their .so files
-# live in site-packages/nvidia/*/lib/ — NOT in the system ld search path.
-# At build time (no GPU on GHA runner), importing NeMo would fail with:
-#   libcudart.so.13: cannot open shared object file: No such file or directory
-# This step adds those paths to ldconfig so dynamic linking works at build time.
-RUN python3 -c "import glob, os, site; paths=[p for sp in site.getsitepackages() for p in glob.glob(os.path.join(sp,'nvidia/*/lib'))]; open('/etc/ld.so.conf.d/nvidia-pypi.conf','w').write('\n'.join(paths)+'\n') if paths else None; print('Registered',len(paths),'CUDA lib paths')" \
-    && ldconfig
+    pip uninstall -y $(pip list --format=freeze 2>/dev/null | grep -oE '^nvidia-[a-z0-9-]+-cu13' || true) || true
 
 # ── 4. Light runtime dependencies ────────────────────────────────────────────
 COPY requirements.txt /tmp/requirements.txt
