@@ -9,10 +9,11 @@ WHISPER_MODEL_PATH = "/models/whisper"
 MIN_WORD_PROBABILITY = 0.3
 
 # Batch size for BatchedInferencePipeline.
-# KB-Whisper-large (~3GB VRAM float16) fits 16+ parallel chunks on an A40
-# (48GB VRAM). Batching is what turns a 3-4 minute 90-min transcription
-# into ~30 seconds — the GPU was almost idle with serial inference.
-BATCH_SIZE = int(os.environ.get("WHISPER_BATCH_SIZE", "16"))
+# KB-Whisper-large (~3GB VRAM float16) fits more at once on A40 (48GB VRAM)
+# but 8 is a safer value across all GPU types the endpoint can land on
+# (including ADA_24 and AMPERE_24 with 24GB VRAM). 8 still gives ~6-8x
+# speedup over serial inference on long files. Override via env if needed.
+BATCH_SIZE = int(os.environ.get("WHISPER_BATCH_SIZE", "8"))
 
 
 def _verify_cuda_or_die():
