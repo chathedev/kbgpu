@@ -52,6 +52,15 @@ COPY requirements-ml.txt /tmp/requirements-ml.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -r /tmp/requirements-ml.txt
 
+# ── 3b. Re-pin torch + torchaudio to cu124 ────────────────────────────────────
+# pyannote.audio 4.0 resolves torch >=2.11/cu13 which needs driver >=560.
+# RunPod workers have driver 550 (CUDA 12.4 max) → "driver too old" RuntimeError.
+# Force-reinstall cu124 wheels of torch+torchaudio with --no-deps after pyannote.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install "torch>=2.4.0,<2.6.0" "torchaudio>=2.4.0,<2.6.0" \
+    --index-url https://download.pytorch.org/whl/cu124 \
+    --force-reinstall --no-deps
+
 # ── 4. Light runtime dependencies ────────────────────────────────────────────
 COPY requirements.txt /tmp/requirements.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
