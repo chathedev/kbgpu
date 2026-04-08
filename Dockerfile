@@ -50,11 +50,14 @@ COPY requirements-ml.txt /tmp/requirements-ml.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -r /tmp/requirements-ml.txt
 
-# ── 3b. Re-pin torch to cu124 ─────────────────────────────────────────────────
+# ── 3b. Re-pin torch + torchaudio to cu124 ────────────────────────────────────
 # nemo_toolkit resolves torch 2.11+/cu13 (driver ≥560 required — workers have 550).
-# Force-reinstall cu124 wheel after nemo to override it. --no-deps avoids cascade.
+# Force-reinstall cu124 wheels of BOTH torch and torchaudio after nemo.
+# torchaudio must match torch version or we get ABI errors like:
+#   _torchaudio.abi3.so: undefined symbol: aoti_torch_abi_version
+# --no-deps avoids cascading dep changes.
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install "torch>=2.2.0,<2.6.0" \
+    pip install "torch>=2.2.0,<2.6.0" "torchaudio>=2.2.0,<2.6.0" \
     --index-url https://download.pytorch.org/whl/cu124 \
     --force-reinstall --no-deps
 
