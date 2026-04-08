@@ -29,32 +29,37 @@ logger.info("=== kbgpu startup: loading models into GPU VRAM ===")
 _t0 = time.time()
 
 _whisper_model = load_whisper_model()           # CTranslate2 float16 on CUDA
-_diar_models = load_diarization_models()        # NeMo VAD + TitaNet on CUDA
+_diar_models = load_diarization_models()        # pyannote community-1 on CUDA
 
 logger.info(f"=== Models loaded in {time.time()-_t0:.1f}s — running GPU warmup ===")
 
 # ---------------------------------------------------------------------------
-# GPU warmup: run both pipelines on 0.5s of silence.
+# GPU warmup: run both pipelines on ~1s of quiet noise.
+# Pure silence confuses pyannote (no voiced frames) so we add a tiny dither.
 # This forces CUDA context initialization for BOTH CTranslate2 AND PyTorch
 # BEFORE any real job arrives, so parallel thread execution is safe.
-# Without warmup, concurrent CUDA init in threads → deadlock / CPU spin.
 # ---------------------------------------------------------------------------
 def _warmup():
-    silence = np.zeros(8000, dtype=np.float32)
+    # 1 second of near-silence with faint white noise — enough for the
+    # pipelines to cold-run without choking on "no speech at all".
+    rng = np.random.default_rng(0)
+    noise = (rng.standard_normal(16000).astype(np.float32) * 1e-4)
     fd, path = tempfile.mkstemp(suffix=".wav")
     os.close(fd)
-    sf.write(path, silence, 16000)
+    sf.write(path, noise, 16000)
     try:
         transcribe(path, _whisper_model)
-        diarize(path, diar_models=_diar_models, num_speakers=1, job_id="warmup")
-        logger.info("GPU warmup complete — CTranslate2 + NeMo CUDA contexts initialized")
     except Exception as e:
-        logger.warning(f"GPU warmup error (non-fatal): {e}")
-    finally:
-        try:
-            os.unlink(path)
-        except Exception:
-            pass
+        logger.warning(f"warmup: whisper error (non-fatal): {e}")
+    try:
+        diarize(path, diar_models=_diar_models, num_speakers=1, job_id="warmup")
+    except Exception as e:
+        logger.warning(f"warmup: pyannote error (non-fatal): {e}")
+    try:
+        os.unlink(path)
+    except Exception:
+        pass
+    logger.info("GPU warmup complete — CUDA contexts initialized")
 
 _warmup()
 logger.info("=== kbgpu ready — all models warm in GPU VRAM ===")

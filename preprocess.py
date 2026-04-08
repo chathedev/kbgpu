@@ -30,10 +30,9 @@ def preprocess_audio(input_path: str) -> str:
         "-ac", "1",
         "-sample_fmt", "s16",
         "-acodec", "pcm_s16le",
-        # Fast peak normalization (dynaudnorm) — 10-20x faster than loudnorm
-        # which does a full-file EBU R128 analysis. dynaudnorm is single-pass
-        # and RMS-based, enough to lift quiet recordings for Whisper.
-        "-af", "dynaudnorm=f=500:g=15:p=0.95",
+        # No loudness filter — loudnorm/dynaudnorm are 1x-realtime on long
+        # files (120s for a 93min meeting). Whisper is robust enough that
+        # the tiny quality win isn't worth 2 minutes of added latency.
         out_path,
     ]
     result = subprocess.run(cmd, capture_output=True, timeout=300)

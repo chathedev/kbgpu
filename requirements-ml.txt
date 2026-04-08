@@ -1,12 +1,8 @@
 # Heavy ML dependencies — installed as a separate layer so they're cached
 # independently of light runtime deps (requirements.txt).
-# torch (CUDA) is installed separately; torchaudio is installed from PyPI here
-# so the CPU wheel is used — it dlopen-succeeds on GHA's CPU-only build runners.
-torchaudio>=2.2.0
+# torch+torchaudio (CUDA cu124) are installed by Dockerfile step 2.
 faster-whisper>=1.0.3
-nemo_toolkit[asr]>=1.23.0
+# pyannote.audio — speaker diarization (community-1 model, much faster than NeMo)
+pyannote.audio>=3.3.2
 numpy>=1.24.0
 soundfile>=0.12.1
-omegaconf>=2.3.0
-hydra-core>=1.3.2
-# librosa removed — preprocess.py uses ffmpeg subprocess (5s vs 90s for large m4a)
