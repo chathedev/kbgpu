@@ -1,7 +1,9 @@
 # Heavy ML dependencies — installed as a separate layer so they're cached
 # independently of light runtime deps (requirements.txt).
 # torch+torchaudio (CUDA cu124) are installed by Dockerfile step 2.
-# KB-Whisper runs via faster-whisper (CTranslate2) — no PyTorch needed for inference.
-faster-whisper>=1.0.3
+# faster-whisper 1.1.x uses CTranslate2 4.4+ which links against cuDNN 9
+# (matching our base image cuda:12.4.1-cudnn-runtime). 1.0.x needs cuDNN 8
+# which doesn't exist in the image → silent CPU fallback. Pin >=1.1.1.
+faster-whisper>=1.1.1
 numpy>=1.24.0
 soundfile>=0.12.1
