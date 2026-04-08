@@ -61,6 +61,24 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     --index-url https://download.pytorch.org/whl/cu124 \
     --force-reinstall --no-deps
 
+# ── 3b2. Install cu12 nvidia runtime libs that torch cu124 needs ──────────────
+# Without --no-deps we couldn't add these (pip conflict with NeMo's cu13).
+# Torch cu124 dlopen()s libcudnn/libcublas/etc from site-packages/nvidia/*/lib.
+# Missing these → "cuDNN error: CUDNN_STATUS_NOT_INITIALIZED" at inference time.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --no-deps \
+    nvidia-cudnn-cu12==9.1.0.70 \
+    nvidia-cublas-cu12 \
+    nvidia-cufft-cu12 \
+    nvidia-curand-cu12 \
+    nvidia-cusolver-cu12 \
+    nvidia-cusparse-cu12 \
+    nvidia-nccl-cu12 \
+    nvidia-nvtx-cu12 \
+    nvidia-cuda-runtime-cu12 \
+    nvidia-cuda-nvrtc-cu12 \
+    nvidia-cuda-cupti-cu12
+
 # ── 3c. Register nvidia CUDA libs from Python packages ────────────────────────
 # NeMo installs nvidia-cuda-runtime-cu13 etc. as Python packages. Their .so files
 # live in site-packages/nvidia/*/lib/ — NOT in the system ld search path.
