@@ -107,8 +107,13 @@ def diarize(
         rttm_path = os.path.join(tmp_dir, "pred_rttms", audio_stem + ".rttm")
         segments = _parse_rttm(rttm_path)
 
+        # Post-merge: glue together same-speaker segments separated by <1s.
+        # This undoes NeMo's over-fragmentation on crosstalk-heavy audio.
+        before = len(segments)
+        segments = _post_merge_segments(segments, max_gap=1.0)
+
         num_spk = len({s["speaker"] for s in segments})
-        logger.info(f"Diarization done: {len(segments)} segments, {num_spk} speakers")
+        logger.info(f"Diarization done: {before}→{len(segments)} segments (post-merged), {num_spk} speakers")
         return segments
 
     finally:
@@ -169,7 +174,10 @@ def _build_config(tmp_dir, manifest_path, num_speakers, diar_models):
                     "oracle_num_speakers": num_speakers is not None,
                     "max_num_speakers": num_speakers if num_speakers else 12,
                     "enhanced_count_thres": 80,
-                    "max_rp_threshold": 0.25,
+                    # Lowered from 0.25 → 0.15: tighter cluster radius reduces
+                    # the "same speaker gets 2 slots" problem on overlapping
+                    # speech without over-merging distinct speakers.
+                    "max_rp_threshold": 0.15,
                     "sparse_search_volume": 30,
                     "maj_vote_spk_count": False,
                 },
@@ -183,7 +191,9 @@ def _build_config(tmp_dir, manifest_path, num_speakers, diar_models):
             "parameters": {
                 "use_speaker_model_from_ckpt": True,
                 "infer_batch_size": 25,
-                "sigmoid_threshold": [0.5, 0.5],
+                # Lowered from 0.5 → 0.4: MSDD emits fewer speaker-change
+                # events on borderline frames, cutting spurious splits.
+                "sigmoid_threshold": [0.4, 0.4],
                 "seq_eval_mode": False,
                 "split_infer": True,
                 "diar_eval_settings": [
@@ -196,6 +206,25 @@ def _build_config(tmp_dir, manifest_path, num_speakers, diar_models):
         logger.info("MSDD enabled for enhanced diarization")
 
     return OmegaConf.create(cfg_dict)
+
+
+def _post_merge_segments(segments: list[dict], max_gap: float = 1.0) -> list[dict]:
+    """
+    Merge consecutive segments from the same speaker if the gap between
+    them is < max_gap seconds. Fixes the common artifact where one speaker
+    gets split into multiple tiny slots across short pauses or overlaps.
+    """
+    if not segments:
+        return segments
+    segments = sorted(segments, key=lambda s: s["start"])
+    merged = [dict(segments[0])]
+    for seg in segments[1:]:
+        last = merged[-1]
+        if seg["speaker"] == last["speaker"] and (seg["start"] - last["end"]) < max_gap:
+            last["end"] = max(last["end"], seg["end"])
+        else:
+            merged.append(dict(seg))
+    return merged
 
 
 def _parse_rttm(rttm_path: str) -> list[dict]:

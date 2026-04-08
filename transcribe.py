@@ -35,10 +35,17 @@ def transcribe(audio_path: str, model: WhisperModel) -> list[dict]:
         language="sv",
         word_timestamps=True,
         vad_filter=True,
-        vad_parameters={"min_silence_duration_ms": 500},
-        beam_size=3,           # 5→3: ~25% faster, negligible quality loss for Swedish
+        vad_parameters={
+            "min_silence_duration_ms": 300,
+            "speech_pad_ms": 200,
+        },
+        beam_size=3,                     # 5→3: ~25% faster, negligible quality loss
         temperature=0.0,
-        # best_of is ignored when temperature=0.0 — omitted for clarity
+        # Quality knobs — suppress hallucination / repetition loops on messy audio
+        condition_on_previous_text=False,  # don't let prior garbage poison next chunk
+        no_speech_threshold=0.6,           # higher → skip more non-speech regions
+        compression_ratio_threshold=2.4,   # reject repeated-token hallucinations
+        log_prob_threshold=-1.0,           # reject low-confidence segments
     )
 
     logger.info(f"Detected language: {info.language} (prob={info.language_probability:.2f}), duration={info.duration:.1f}s")
