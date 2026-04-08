@@ -26,10 +26,11 @@ def load_diarization_models() -> DiarizationModels:
 
     logger.info(f"Loading {PYANNOTE_MODEL} from local HF cache...")
     try:
-        token = os.environ.get("HF_TOKEN")
+        hf_token = os.environ.get("HF_TOKEN")
+        # pyannote.audio 4.0 renamed use_auth_token → token
         pipeline = Pipeline.from_pretrained(
             PYANNOTE_MODEL,
-            use_auth_token=token,
+            token=hf_token,
         )
         if torch.cuda.is_available():
             pipeline.to(torch.device("cuda"))
