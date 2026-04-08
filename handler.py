@@ -1,3 +1,18 @@
+"""
+kbgpu worker — TRANSCRIPTION ONLY.
+
+Diarization is done in the TIVLY backend via the pyannoteAI Precision-2 API.
+This worker's sole job is: download audio → 16kHz mono WAV → KB-Whisper → words.
+
+Output shape:
+    {
+        "words": [ {word, start, end, probability}, ... ],
+        "language": "sv",
+        "duration_seconds": float,
+        "processing_time_seconds": float,
+        "audio_url": str,
+    }
+"""
 import os
 import time
 import logging
@@ -6,7 +21,6 @@ import numpy as np
 import requests
 import runpod
 import soundfile as sf
-from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
 
 logging.basicConfig(
@@ -17,42 +31,19 @@ logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Module-level model loading — runs ONCE per container lifetime.
-# This is the key to fast response: models are hot in GPU VRAM between jobs.
+# Model hot in VRAM across jobs → sub-second dispatch after FlashBoot wake-up.
 # ---------------------------------------------------------------------------
-from transcribe import load_whisper_model
+from transcribe import load_whisper_model, transcribe
 from preprocess import preprocess_audio
-from transcribe import transcribe
-from diarize import load_diarization_models, diarize
-from merge import merge
 
-logger.info("=== kbgpu startup: loading models into GPU VRAM ===")
+logger.info("=== kbgpu startup: loading KB-Whisper into GPU VRAM ===")
 _t0 = time.time()
+_whisper_model = load_whisper_model()
+logger.info(f"=== Whisper loaded in {time.time()-_t0:.1f}s — running GPU warmup ===")
 
-# Whisper is fast & always works — any crash here is catastrophic, let it raise.
-_whisper_model = load_whisper_model()           # CTranslate2 float16 on CUDA
 
-# Pyannote load is more fragile (HF download, CUDA ops, model-config version
-# checks). If it fails, keep the worker alive and surface the error PER JOB
-# rather than crash-looping silently (shows as "throttled" in RunPod health).
-_diar_models = None
-_diar_load_error = None
-try:
-    _diar_models = load_diarization_models()    # pyannote community-1 on CUDA
-except Exception as e:
-    _diar_load_error = f"{type(e).__name__}: {e}"
-    logger.exception(f"Diarization model load FAILED at startup: {_diar_load_error}")
-
-logger.info(f"=== Models loaded in {time.time()-_t0:.1f}s — running GPU warmup ===")
-
-# ---------------------------------------------------------------------------
-# GPU warmup: run both pipelines on ~1s of quiet noise.
-# Pure silence confuses pyannote (no voiced frames) so we add a tiny dither.
-# This forces CUDA context initialization for BOTH CTranslate2 AND PyTorch
-# BEFORE any real job arrives, so parallel thread execution is safe.
-# ---------------------------------------------------------------------------
 def _warmup():
-    # 1 second of near-silence with faint white noise — enough for the
-    # pipelines to cold-run without choking on "no speech at all".
+    """Force CUDA context init on 1s of near-silence before the first real job."""
     rng = np.random.default_rng(0)
     noise = (rng.standard_normal(16000).astype(np.float32) * 1e-4)
     fd, path = tempfile.mkstemp(suffix=".wav")
@@ -60,39 +51,29 @@ def _warmup():
     sf.write(path, noise, 16000)
     try:
         transcribe(path, _whisper_model)
+        logger.info("GPU warmup complete")
     except Exception as e:
-        logger.warning(f"warmup: whisper error (non-fatal): {e}")
-    if _diar_models is not None:
+        logger.warning(f"warmup error (non-fatal): {e}")
+    finally:
         try:
-            diarize(path, diar_models=_diar_models, num_speakers=1, job_id="warmup")
-        except Exception as e:
-            logger.warning(f"warmup: pyannote error (non-fatal): {e}")
-    try:
-        os.unlink(path)
-    except Exception:
-        pass
-    logger.info("GPU warmup complete — CUDA contexts initialized")
+            os.unlink(path)
+        except Exception:
+            pass
+
 
 _warmup()
-logger.info("=== kbgpu ready — all models warm in GPU VRAM ===")
+logger.info("=== kbgpu ready — whisper warm in GPU VRAM ===")
 
 
 def handler(job: dict) -> dict:
     job_input = job.get("input", {})
     audio_url = job_input.get("audio_url")
-    num_speakers = job_input.get("num_speakers")
     job_id = job_input.get("job_id") or job.get("id") or "unknown"
 
-    logger.info(f"[{job_id}] Job received: audio_url={audio_url}, num_speakers={num_speakers}")
+    logger.info(f"[{job_id}] Job received: audio_url={audio_url}")
 
     if not audio_url:
         return {"error": "Missing required field: audio_url", "audio_url": None}
-
-    if _diar_models is None:
-        return {
-            "error": f"Diarization model failed to load at startup: {_diar_load_error}",
-            "audio_url": audio_url,
-        }
 
     start_time = time.time()
     downloaded_path = None
@@ -102,65 +83,27 @@ def handler(job: dict) -> dict:
         # 1. Download
         t0 = time.time()
         downloaded_path = _download_audio(audio_url, job_id)
-        logger.info(f"[{job_id}] Download: {time.time()-t0:.1f}s ({os.path.getsize(downloaded_path)/1e6:.1f}MB)")
+        size_mb = os.path.getsize(downloaded_path) / 1e6
+        logger.info(f"[{job_id}] Download: {time.time()-t0:.1f}s ({size_mb:.1f}MB)")
 
-        # 2. Preprocess: ffmpeg → 16kHz mono WAV (~5s for any file size)
+        # 2. Preprocess: ffmpeg → 16kHz mono WAV
         t0 = time.time()
         preprocessed_path = preprocess_audio(downloaded_path)
         with sf.SoundFile(preprocessed_path) as f:
             duration_seconds = round(len(f) / f.samplerate, 2)
         logger.info(f"[{job_id}] Preprocess: {time.time()-t0:.1f}s → {duration_seconds:.1f}s audio")
 
-        # 3+4. Transcribe + Diarize IN PARALLEL on the A40/A6000.
-        #
-        # This is safe because:
-        #  a) GPU warmup above pre-initialized CUDA contexts for both engines
-        #  b) NeMo uses num_workers=0 (no process forking after CUDA init)
-        #  c) CTranslate2 and PyTorch share the CUDA device, CUDA scheduler
-        #     interleaves their kernels — both see high GPU utilization
-        #
-        # Expected wall time: max(whisper_time, nemo_time) instead of sum.
+        # 3. Transcribe (no parallelism needed — only one task)
         t0 = time.time()
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            transcribe_fut = executor.submit(
-                transcribe, preprocessed_path, _whisper_model
-            )
-            diarize_fut = executor.submit(
-                diarize, preprocessed_path,
-                diar_models=_diar_models,
-                num_speakers=num_speakers,
-                job_id=job_id,
-            )
-            words = transcribe_fut.result()
-            diar_segments = diarize_fut.result()
+        words = transcribe(preprocessed_path, _whisper_model)
+        logger.info(f"[{job_id}] Transcribe: {time.time()-t0:.1f}s → {len(words)} words")
 
-        logger.info(
-            f"[{job_id}] Transcribe+Diarize parallel: {time.time()-t0:.1f}s "
-            f"→ {len(words)} words, {len(diar_segments)} segments"
-        )
-
-        # 5. Merge
-        utterances = merge(words, diar_segments)
-
-        # 6. Output
         processing_time = round(time.time() - start_time, 2)
-        unique_speakers = list({u["speaker"] for u in utterances})
-        num_speakers_detected = len(unique_speakers)
-        word_speaker_map = _build_word_speaker_map(words, utterances)
-
-        logger.info(
-            f"[{job_id}] Done in {processing_time}s: "
-            f"{len(utterances)} utterances, {num_speakers_detected} speakers, "
-            f"{duration_seconds}s audio"
-        )
+        logger.info(f"[{job_id}] Done in {processing_time}s ({len(words)} words, {duration_seconds}s audio)")
 
         return {
-            "utterances": [
-                {"speaker": u["speaker"], "start": u["start"], "end": u["end"], "text": u["text"]}
-                for u in utterances
-            ],
-            "words": word_speaker_map,
-            "num_speakers": num_speakers_detected,
+            "words": words,
+            "language": "sv",
             "duration_seconds": duration_seconds,
             "processing_time_seconds": processing_time,
             "audio_url": audio_url,
@@ -195,15 +138,6 @@ def _download_audio(url: str, job_id: str) -> str:
             if chunk:
                 f.write(chunk)
     return out_path
-
-
-def _build_word_speaker_map(words: list[dict], utterances: list[dict]) -> list[dict]:
-    result = []
-    for utt in utterances:
-        for w in utt.get("words", []):
-            result.append({"word": w["word"], "start": w["start"], "end": w["end"], "speaker": utt["speaker"]})
-    result.sort(key=lambda w: w["start"])
-    return result
 
 
 runpod.serverless.start({"handler": handler})

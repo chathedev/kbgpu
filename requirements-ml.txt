@@ -1,9 +1,7 @@
 # Heavy ML dependencies — installed as a separate layer so they're cached
 # independently of light runtime deps (requirements.txt).
 # torch+torchaudio (CUDA cu124) are installed by Dockerfile step 2.
+# KB-Whisper runs via faster-whisper (CTranslate2) — no PyTorch needed for inference.
 faster-whisper>=1.0.3
-# pyannote.audio — speaker diarization (community-1 model, much faster than NeMo)
-# pyannote community-1 config requires pyannote.audio 4.0.0+
-pyannote.audio>=4.0.0,<5.0.0
 numpy>=1.24.0
 soundfile>=0.12.1
