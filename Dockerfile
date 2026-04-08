@@ -66,7 +66,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # Torch cu124 dlopen()s libcudnn/libcublas/etc from site-packages/nvidia/*/lib.
 # Missing these → "cuDNN error: CUDNN_STATUS_NOT_INITIALIZED" at inference time.
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --no-deps \
+    pip uninstall -y $(pip list --format=freeze 2>/dev/null | grep -oE '^nvidia-[a-z0-9-]+-cu13' || true) || true \
+    && pip install --no-deps \
     nvidia-cudnn-cu12==9.1.0.70 \
     nvidia-cublas-cu12 \
     nvidia-cufft-cu12 \
