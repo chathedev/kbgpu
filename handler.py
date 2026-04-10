@@ -1,17 +1,14 @@
 """
-kbgpu worker — TRANSCRIPTION ONLY.
+kbgpu worker — Swedish ASR + speaker diarization on a single GPU.
 
-Diarization is done in the TIVLY backend via the pyannoteAI Precision-2 API.
-This worker's sole job is: download audio → 16kHz mono WAV → KB-Whisper → words.
+Pipelines on RunPod serverless:
+    mode="transcribe": download audio → 16kHz WAV → KB-Whisper → words
+    mode="diarize":    download audio → DiariZen speaker segmentation
+    mode="separate":   extract a denoised short clip for speaker samples
 
-Output shape:
-    {
-        "words": [ {word, start, end, probability}, ... ],
-        "language": "sv",
-        "duration_seconds": float,
-        "processing_time_seconds": float,
-        "audio_url": str,
-    }
+Transcription and diarization are loaded into VRAM at container boot so
+FlashBoot wake-ups start sub-second. Backend calls them in parallel over
+two RunPod requests.
 """
 import os
 import time
@@ -31,7 +28,6 @@ logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Module-level model loading — runs ONCE per container lifetime.
-# Model hot in VRAM across jobs → sub-second dispatch after FlashBoot wake-up.
 # ---------------------------------------------------------------------------
 from transcribe import load_whisper_model, transcribe
 from preprocess import preprocess_audio
@@ -39,7 +35,21 @@ from preprocess import preprocess_audio
 logger.info("=== kbgpu startup: loading KB-Whisper into GPU VRAM ===")
 _t0 = time.time()
 _whisper_model = load_whisper_model()
-logger.info(f"=== Whisper loaded in {time.time()-_t0:.1f}s — running GPU warmup ===")
+logger.info(f"=== Whisper loaded in {time.time()-_t0:.1f}s ===")
+
+# Diarization pipeline loaded lazily-but-eagerly. If it fails we still want
+# the container to serve transcription — diarization mode will return an
+# error but the worker remains useful.
+_diar_pipeline = None
+_diar_load_error = None
+try:
+    from diarize import load_diarization_pipeline, diarize
+    _t1 = time.time()
+    _diar_pipeline = load_diarization_pipeline()
+    logger.info(f"=== Diarization pipeline loaded in {time.time()-_t1:.1f}s ===")
+except Exception as diar_err:
+    _diar_load_error = str(diar_err)
+    logger.exception(f"Diarization pipeline failed to load: {diar_err}")
 
 
 def _warmup():
@@ -51,7 +61,7 @@ def _warmup():
     sf.write(path, noise, 16000)
     try:
         transcribe(path, _whisper_model)
-        logger.info("GPU warmup complete")
+        logger.info("Whisper GPU warmup complete")
     except Exception as e:
         logger.warning(f"warmup error (non-fatal): {e}")
     finally:
@@ -62,7 +72,7 @@ def _warmup():
 
 
 _warmup()
-logger.info("=== kbgpu ready — whisper warm in GPU VRAM ===")
+logger.info("=== kbgpu ready ===")
 
 
 def handler(job: dict) -> dict:
@@ -79,6 +89,9 @@ def handler(job: dict) -> dict:
     if mode == "separate":
         return _handle_separate(job_input, job_id)
 
+    if mode == "diarize":
+        return _handle_diarize(job_input, job_id)
+
     return _handle_transcribe(job_input, job_id)
 
 
@@ -89,20 +102,17 @@ def _handle_transcribe(job_input: dict, job_id: str) -> dict:
     preprocessed_path = None
 
     try:
-        # 1. Download
         t0 = time.time()
         downloaded_path = _download_audio(audio_url, job_id)
         size_mb = os.path.getsize(downloaded_path) / 1e6
         logger.info(f"[{job_id}] Download: {time.time()-t0:.1f}s ({size_mb:.1f}MB)")
 
-        # 2. Preprocess: ffmpeg → 16kHz mono WAV
         t0 = time.time()
         preprocessed_path = preprocess_audio(downloaded_path)
         with sf.SoundFile(preprocessed_path) as f:
             duration_seconds = round(len(f) / f.samplerate, 2)
         logger.info(f"[{job_id}] Preprocess: {time.time()-t0:.1f}s → {duration_seconds:.1f}s audio")
 
-        # 3. Transcribe (no parallelism needed — only one task)
         t0 = time.time()
         words = transcribe(preprocessed_path, _whisper_model)
         logger.info(f"[{job_id}] Transcribe: {time.time()-t0:.1f}s → {len(words)} words")
@@ -133,16 +143,87 @@ def _handle_transcribe(job_input: dict, job_id: str) -> dict:
                     pass
 
 
+def _handle_diarize(job_input: dict, job_id: str) -> dict:
+    """
+    Speaker diarization on a full audio file.
+
+    Input:
+        { mode: "diarize", audio_url: str,
+          num_speakers?: int, min_speakers?: int, max_speakers?: int }
+
+    Output:
+        { segments: [{speaker, start, end}, ...],
+          speaker_count: int,
+          duration_seconds: float,
+          processing_time_seconds: float }
+    """
+    if _diar_pipeline is None:
+        return {
+            "error": f"Diarization pipeline unavailable: {_diar_load_error}",
+            "audio_url": job_input.get("audio_url"),
+        }
+
+    audio_url = job_input["audio_url"]
+    start_time = time.time()
+    downloaded_path = None
+    preprocessed_path = None
+
+    try:
+        t0 = time.time()
+        downloaded_path = _download_audio(audio_url, job_id)
+        size_mb = os.path.getsize(downloaded_path) / 1e6
+        logger.info(f"[{job_id}] diar download: {time.time()-t0:.1f}s ({size_mb:.1f}MB)")
+
+        t0 = time.time()
+        preprocessed_path = preprocess_audio(downloaded_path)
+        with sf.SoundFile(preprocessed_path) as f:
+            duration_seconds = round(len(f) / f.samplerate, 2)
+        logger.info(f"[{job_id}] diar preprocess: {time.time()-t0:.1f}s → {duration_seconds:.1f}s audio")
+
+        t0 = time.time()
+        segments = diarize(
+            preprocessed_path,
+            _diar_pipeline,
+            num_speakers=job_input.get("num_speakers"),
+            min_speakers=job_input.get("min_speakers"),
+            max_speakers=job_input.get("max_speakers"),
+        )
+        logger.info(f"[{job_id}] diar inference: {time.time()-t0:.1f}s → {len(segments)} segments")
+
+        speaker_count = len({s["speaker"] for s in segments})
+        processing_time = round(time.time() - start_time, 2)
+        logger.info(f"[{job_id}] diar done in {processing_time}s ({speaker_count} speakers, {duration_seconds}s audio)")
+
+        return {
+            "segments": segments,
+            "speaker_count": speaker_count,
+            "duration_seconds": duration_seconds,
+            "processing_time_seconds": processing_time,
+            "audio_url": audio_url,
+        }
+
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        logger.exception(f"[{job_id}] Diarize failed: {e}")
+        return {"error": str(e), "traceback": tb, "audio_url": audio_url}
+
+    finally:
+        for path in [downloaded_path, preprocessed_path]:
+            if path and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+
+
 def _handle_separate(job_input: dict, job_id: str) -> dict:
     """
-    Speaker sample isolation: extract a clip, apply aggressive noise gate +
-    speech enhancement to isolate the dominant voice. Fast (~1-2s).
-
-    Uses energy-based gating: periods where RMS energy drops below threshold
-    are silenced, effectively removing quiet background speakers.
+    Speaker sample isolation: extract a clip with aggressive noise gate +
+    bandpass filtering to isolate the dominant voice.
 
     Input:  { mode: "separate", audio_url: str, start?: float, end?: float }
-    Output: { vocals_base64: str, duration_seconds: float, processing_time_seconds: float }
+    Output: { vocals_base64, duration_seconds, processing_time_seconds }
     """
     import base64
     import subprocess
@@ -154,16 +235,10 @@ def _handle_separate(job_input: dict, job_id: str) -> dict:
     downloaded_path = None
 
     try:
-        # 1. Download
         t0 = time.time()
         downloaded_path = _download_audio(audio_url, job_id)
         logger.info(f"[{job_id}] Separate: download {time.time()-t0:.1f}s")
 
-        # 2. Extract clip with aggressive speech isolation filters:
-        #    - highpass/lowpass: keep only speech frequencies (80-6000Hz)
-        #    - agate: noise gate silences audio below threshold (kills background speakers)
-        #    - acompressor: even out volume
-        #    - silenceremove: trim leading/trailing silence
         clean_path = f"/tmp/{job_id}_clean.wav"
         args = ["ffmpeg", "-y"]
         if clip_start is not None:
@@ -182,7 +257,6 @@ def _handle_separate(job_input: dict, job_id: str) -> dict:
         ]
         subprocess.run(args, capture_output=True, timeout=30, check=True)
 
-        # 3. Read and base64 encode
         with open(clean_path, "rb") as f:
             vocals_data = f.read()
 

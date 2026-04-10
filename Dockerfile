@@ -1,13 +1,11 @@
 # syntax=docker/dockerfile:1
 # ─────────────────────────────────────────────────────────────────────────────
-# kbgpu — Swedish ASR worker (KB-Whisper transcription ONLY)
+# kbgpu — Swedish ASR + speaker diarization worker
 #
-# Pipeline on RunPod serverless:
-#   download audio → ffmpeg 16kHz mono WAV → KB-Whisper → words
-#
-# Speaker diarization is done separately in the TIVLY backend via the
-# pyannoteAI Precision-2 API — keeping this worker laser-focused on Whisper
-# gives much faster startup, smaller image, and fewer moving parts.
+# Pipelines on RunPod serverless:
+#   mode=transcribe: download audio → ffmpeg 16kHz mono WAV → KB-Whisper → words
+#   mode=diarize   : download audio → DiariZen → speaker segments
+#   mode=separate  : denoise / isolate a speaker sample clip
 #
 # Target: RunPod workers with GPU driver 550.x → CUDA 12.4 max.
 # Using cuda:12.4.1-cudnn-runtime keeps system cuDNN on the default ld path,
@@ -19,7 +17,9 @@ FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PIP_CACHE_DIR=/root/.cache/pip
+    PIP_CACHE_DIR=/root/.cache/pip \
+    HF_HOME=/models/diar \
+    HUGGINGFACE_HUB_CACHE=/models/diar
 
 # ── 1. System deps ────────────────────────────────────────────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -28,6 +28,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-pip \
     ffmpeg \
     libsndfile1 \
+    git \
     && rm -rf /var/lib/apt/lists/* \
     && ln -sf /usr/bin/python3.10 /usr/bin/python3 \
     && ln -sf /usr/bin/python3.10 /usr/bin/python
@@ -36,29 +37,43 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install --upgrade pip setuptools wheel
 
 # ── 2. PyTorch cu124 ─────────────────────────────────────────────────────────
-# faster-whisper doesn't need torch for inference (it uses CTranslate2) but
-# we install it anyway in case future features need it. Keeps the image
-# versatile without measurable cold-start cost — torch is lazy-imported.
+# faster-whisper doesn't strictly need torch (it uses CTranslate2) but
+# DiariZen / pyannote.audio do. Install once, let both consume it.
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install "torch>=2.4.0,<2.6.0" "torchaudio>=2.4.0,<2.6.0" \
     --index-url https://download.pytorch.org/whl/cu124
 
-# ── 3. ML libraries (faster-whisper only — no pyannote, no NeMo) ─────────────
+# ── 3. ML libraries (faster-whisper + DiariZen deps) ─────────────────────────
 COPY requirements-ml.txt /tmp/requirements-ml.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -r /tmp/requirements-ml.txt
 
-# ── 4. Light runtime dependencies ────────────────────────────────────────────
+# ── 4. DiariZen from source ──────────────────────────────────────────────────
+# DiariZen ships the pipeline code + a pyannote-audio fork as a submodule.
+# We `pip install --no-deps -e .` so it doesn't try to downgrade torch or
+# pyannote (those are already installed from requirements-ml.txt).
+RUN git clone --depth 1 https://github.com/BUTSpeechFIT/DiariZen.git /opt/diarizen \
+    && cd /opt/diarizen \
+    && git submodule update --init --recursive || true
+RUN --mount=type=cache,target=/root/.cache/pip \
+    cd /opt/diarizen && pip install --no-deps -e .
+# Install the bundled pyannote-audio fork if present (overrides the pip one).
+RUN --mount=type=cache,target=/root/.cache/pip \
+    if [ -d /opt/diarizen/pyannote-audio ]; then \
+        cd /opt/diarizen/pyannote-audio && pip install --no-deps -e .; \
+    fi
+
+# ── 5. Light runtime dependencies ────────────────────────────────────────────
 COPY requirements.txt /tmp/requirements.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -r /tmp/requirements.txt
 
-# ── 5. Download and bake KB-Whisper-large into the image ─────────────────────
+# ── 6. Pre-download models into image layer ─────────────────────────────────
 WORKDIR /app
 COPY download_models.py .
 RUN python3 download_models.py
 
-# ── 6. Application code ───────────────────────────────────────────────────────
-COPY handler.py transcribe.py preprocess.py ./
+# ── 7. Application code ───────────────────────────────────────────────────────
+COPY handler.py transcribe.py preprocess.py diarize.py ./
 
 CMD ["python3", "-u", "handler.py"]

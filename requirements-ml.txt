@@ -2,8 +2,21 @@
 # independently of light runtime deps (requirements.txt).
 # torch+torchaudio (CUDA cu124) are installed by Dockerfile step 2.
 # faster-whisper 1.1.x uses CTranslate2 4.4+ which links against cuDNN 9
-# (matching our base image cuda:12.4.1-cudnn-runtime). 1.0.x needs cuDNN 8
-# which doesn't exist in the image → silent CPU fallback. Pin >=1.1.1.
+# (matching our base image cuda:12.4.1-cudnn-runtime). Pin >=1.1.1.
 faster-whisper>=1.1.1
-numpy>=1.24.0
+numpy>=1.24.0,<2.0.0
 soundfile>=0.12.1
+
+# DiariZen dependencies. DiariZen itself is installed from source via
+# `pip install -e .` in the Dockerfile (layer after this one) since its
+# repo ships the pipeline code + a pyannote-audio fork as a submodule.
+# The packages below cover everything DiariZen needs at inference time.
+pyannote.audio>=3.3.0
+transformers>=4.41.0
+huggingface_hub>=0.24.0
+einops>=0.7.0
+asteroid-filterbanks>=0.4.0
+speechbrain>=1.0.0
+scipy>=1.10.0
+scikit-learn>=1.3.0
+omegaconf>=2.3.0
