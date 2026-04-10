@@ -1,22 +1,30 @@
-# Heavy ML dependencies — installed as a separate layer so they're cached
-# independently of light runtime deps (requirements.txt).
-# torch+torchaudio (CUDA cu124) are installed by Dockerfile step 2.
-# faster-whisper 1.1.x uses CTranslate2 4.4+ which links against cuDNN 9
-# (matching our base image cuda:12.4.1-cudnn-runtime). Pin >=1.1.1.
-faster-whisper>=1.1.1
-numpy>=1.24.0,<2.0.0
-soundfile>=0.12.1
+# Heavy ML dependencies. Pinned to avoid pip's resolver backtracking:
+# pyannote.audio latest wants torch>=2.8 which conflicts with our torch
+# 2.4.x cu124 base. We pin to a version that still works with torch 2.4.
+#
+# Dockerfile installs torch/torchaudio cu124 in a previous layer; these
+# packages are installed with the legacy resolver to avoid exponential
+# backtracking.
 
-# DiariZen dependencies. DiariZen itself is installed from source via
-# `pip install -e .` in the Dockerfile (layer after this one) since its
-# repo ships the pipeline code + a pyannote-audio fork as a submodule.
-# The packages below cover everything DiariZen needs at inference time.
-pyannote.audio>=3.3.0
-transformers>=4.41.0
-huggingface_hub>=0.24.0
-einops>=0.7.0
-asteroid-filterbanks>=0.4.0
-speechbrain>=1.0.0
-scipy>=1.10.0
-scikit-learn>=1.3.0
-omegaconf>=2.3.0
+faster-whisper==1.1.1
+numpy==1.26.4
+soundfile==0.12.1
+scipy==1.13.1
+scikit-learn==1.5.2
+
+# Pyannote + its lightning-based deps pinned to versions known to work
+# with torch 2.4 / CUDA 12.4.
+pyannote.audio==3.3.2
+lightning==2.4.0
+torchmetrics==1.4.2
+
+# HF + transformers pinned. Newer transformers pulls in torch 2.6+.
+transformers==4.45.2
+huggingface_hub==0.26.2
+tokenizers==0.20.3
+safetensors==0.4.5
+
+# DiariZen runtime deps.
+einops==0.8.0
+asteroid-filterbanks==0.4.0
+omegaconf==2.3.0

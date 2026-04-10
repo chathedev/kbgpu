@@ -44,9 +44,12 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     --index-url https://download.pytorch.org/whl/cu124
 
 # ── 3. ML libraries (faster-whisper + DiariZen deps) ─────────────────────────
+# Use the legacy resolver so pip doesn't spend minutes backtracking across
+# 30+ lightning/fsspec/torchmetrics version combinations. All versions
+# are pinned in requirements-ml.txt.
 COPY requirements-ml.txt /tmp/requirements-ml.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install -r /tmp/requirements-ml.txt
+    pip install --use-deprecated=legacy-resolver -r /tmp/requirements-ml.txt
 
 # ── 4. DiariZen from source ──────────────────────────────────────────────────
 # DiariZen ships the pipeline code + a pyannote-audio fork as a submodule.
