@@ -8,15 +8,13 @@ logger = logging.getLogger(__name__)
 
 TARGET_SR = 16000
 
-# Fast audio enhancement — all filters run at 10-50x realtime.
-# NO anlmdn (non-local means denoiser) — it's O(n²) and ~1x realtime on long files.
-# Instead: highpass + lowpass cut noise bands, compressor brings up quiet speech,
-# loudnorm ensures consistent level. Total overhead: ~5-10s for a 2-hour file.
+# Fast audio enhancement — ALL filters are single-pass, instant (no 2-pass analysis).
+# NO anlmdn (O(n²) denoiser), NO loudnorm (2-pass, ~1x realtime on long files).
+# Compressor + makeup gain handles level normalization in a single pass.
 ENHANCE_FILTER = (
     "highpass=f=80,"
     "lowpass=f=8000,"
-    "acompressor=threshold=-25dB:ratio=4:attack=5:release=100:makeup=8,"
-    "loudnorm=I=-16:TP=-1.5:LRA=11"
+    "acompressor=threshold=-25dB:ratio=4:attack=5:release=100:makeup=8"
 )
 
 
@@ -46,7 +44,7 @@ def preprocess_audio(input_path: str) -> str:
         "-acodec", "pcm_s16le",
         out_path,
     ]
-    result = subprocess.run(cmd, capture_output=True, timeout=120)
+    result = subprocess.run(cmd, capture_output=True, timeout=300)
     if result.returncode == 0:
         size_mb = os.path.getsize(out_path) / (1024 * 1024)
         elapsed = time.time() - t0
