@@ -67,14 +67,23 @@ logger.info("=== kbgpu ready — whisper warm in GPU VRAM ===")
 
 def handler(job: dict) -> dict:
     job_input = job.get("input", {})
+    mode = job_input.get("mode", "transcribe")
     audio_url = job_input.get("audio_url")
     job_id = job_input.get("job_id") or job.get("id") or "unknown"
 
-    logger.info(f"[{job_id}] Job received: audio_url={audio_url}")
+    logger.info(f"[{job_id}] Job received: mode={mode} audio_url={audio_url}")
 
     if not audio_url:
         return {"error": "Missing required field: audio_url", "audio_url": None}
 
+    if mode == "separate":
+        return _handle_separate(job_input, job_id)
+
+    return _handle_transcribe(job_input, job_id)
+
+
+def _handle_transcribe(job_input: dict, job_id: str) -> dict:
+    audio_url = job_input["audio_url"]
     start_time = time.time()
     downloaded_path = None
     preprocessed_path = None
@@ -122,6 +131,114 @@ def handler(job: dict) -> dict:
                     os.remove(path)
                 except Exception:
                     pass
+
+
+def _handle_separate(job_input: dict, job_id: str) -> dict:
+    """
+    Vocal isolation mode: download a short audio clip, run Demucs htdemucs
+    to separate vocals, return the isolated vocal track as base64 WAV.
+
+    Input:  { mode: "separate", audio_url: str, start?: float, end?: float }
+    Output: { vocals_base64: str, duration_seconds: float, processing_time_seconds: float }
+    """
+    import base64
+    import subprocess
+
+    audio_url = job_input["audio_url"]
+    clip_start = job_input.get("start")
+    clip_end = job_input.get("end")
+    start_time = time.time()
+    downloaded_path = None
+    clip_path = None
+    separated_dir = None
+
+    try:
+        # 1. Download full audio
+        t0 = time.time()
+        downloaded_path = _download_audio(audio_url, job_id)
+        logger.info(f"[{job_id}] Separate: download {time.time()-t0:.1f}s")
+
+        # 2. Extract clip if start/end specified
+        if clip_start is not None and clip_end is not None:
+            clip_path = f"/tmp/{job_id}_clip.wav"
+            duration = float(clip_end) - float(clip_start)
+            subprocess.run([
+                "ffmpeg", "-y", "-ss", str(clip_start), "-t", str(duration),
+                "-i", downloaded_path, "-ar", "44100", "-ac", "2",
+                "-acodec", "pcm_s16le", clip_path,
+            ], capture_output=True, timeout=30, check=True)
+            input_path = clip_path
+        else:
+            input_path = downloaded_path
+
+        # 3. Run Demucs vocal separation (GPU-accelerated, ~2-3s for 15s clip)
+        t0 = time.time()
+        separated_dir = f"/tmp/{job_id}_separated"
+        os.makedirs(separated_dir, exist_ok=True)
+
+        subprocess.run([
+            "python3", "-m", "demucs",
+            "--two-stems", "vocals",  # only separate vocals vs rest
+            "-n", "htdemucs",         # fast model
+            "-d", "cuda",             # GPU
+            "-o", separated_dir,
+            input_path,
+        ], capture_output=True, timeout=120, check=True)
+
+        # Find the vocals output file
+        vocals_path = None
+        for root, dirs, files in os.walk(separated_dir):
+            for f in files:
+                if "vocals" in f.lower():
+                    vocals_path = os.path.join(root, f)
+                    break
+            if vocals_path:
+                break
+
+        if not vocals_path or not os.path.exists(vocals_path):
+            raise RuntimeError("Demucs did not produce a vocals file")
+
+        logger.info(f"[{job_id}] Demucs separation: {time.time()-t0:.1f}s")
+
+        # 4. Convert vocals to mono 16kHz WAV + apply speech enhancement
+        clean_path = f"/tmp/{job_id}_clean.wav"
+        subprocess.run([
+            "ffmpeg", "-y", "-i", vocals_path,
+            "-af", "highpass=f=80,lowpass=f=8000,acompressor=threshold=-25dB:ratio=4:attack=5:release=100:makeup=8",
+            "-ar", "16000", "-ac", "1", "-acodec", "pcm_s16le", clean_path,
+        ], capture_output=True, timeout=30, check=True)
+
+        # 5. Read and base64 encode
+        with open(clean_path, "rb") as f:
+            vocals_data = f.read()
+
+        with sf.SoundFile(clean_path) as f:
+            duration_seconds = round(len(f) / f.samplerate, 2)
+
+        processing_time = round(time.time() - start_time, 2)
+        logger.info(f"[{job_id}] Separate done: {processing_time}s, {duration_seconds}s audio, {len(vocals_data)/1024:.0f}KB")
+
+        return {
+            "vocals_base64": base64.b64encode(vocals_data).decode("ascii"),
+            "duration_seconds": duration_seconds,
+            "processing_time_seconds": processing_time,
+        }
+
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        logger.exception(f"[{job_id}] Separate failed: {e}")
+        return {"error": str(e), "traceback": tb}
+
+    finally:
+        import shutil
+        for p in [downloaded_path, clip_path]:
+            if p and os.path.exists(p):
+                try: os.remove(p)
+                except: pass
+        if separated_dir and os.path.exists(separated_dir):
+            try: shutil.rmtree(separated_dir)
+            except: pass
 
 
 def _download_audio(url: str, job_id: str) -> str:
