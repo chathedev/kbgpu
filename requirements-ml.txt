@@ -7,6 +7,3 @@
 faster-whisper>=1.1.1
 numpy>=1.24.0
 soundfile>=0.12.1
-# Demucs — vocal separation for speaker sample isolation.
-# Used in "separate" mode to clean speaker audio clips (~2-3s on GPU for 15s clip).
-demucs>=4.0.0
