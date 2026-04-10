@@ -9,11 +9,21 @@ WHISPER_MODEL_PATH = "/models/whisper"
 MIN_WORD_PROBABILITY = 0.3
 
 # Batch size for BatchedInferencePipeline.
-# KB-Whisper-large (~3GB VRAM float16) fits more at once on A40 (48GB VRAM)
-# but 8 is a safer value across all GPU types the endpoint can land on
-# (including ADA_24 and AMPERE_24 with 24GB VRAM). 8 still gives ~6-8x
-# speedup over serial inference on long files. Override via env if needed.
-BATCH_SIZE = int(os.environ.get("WHISPER_BATCH_SIZE", "8"))
+# Auto-detect based on available VRAM: more VRAM = bigger batches = faster.
+# KB-Whisper-large uses ~3GB base + ~0.5GB per batch item.
+def _auto_batch_size():
+    try:
+        import torch
+        if torch.cuda.is_available():
+            vram_gb = torch.cuda.get_device_properties(0).total_mem / (1024**3)
+            if vram_gb >= 70: return 24   # H100/A100 80GB
+            if vram_gb >= 40: return 16   # A40/L40S/A6000 48GB
+            if vram_gb >= 20: return 8    # RTX 4090/3090 24GB
+        return 8
+    except Exception:
+        return 8
+
+BATCH_SIZE = int(os.environ.get("WHISPER_BATCH_SIZE", "0")) or _auto_batch_size()
 
 
 def _verify_cuda_or_die():
@@ -88,7 +98,7 @@ def transcribe(audio_path: str, pipeline: BatchedInferencePipeline) -> list[dict
             "min_silence_duration_ms": 300,
             "speech_pad_ms": 200,
         },
-        beam_size=3,                        # 5→3: ~25% faster, negligible quality loss
+        beam_size=1,                        # greedy decode: ~2x faster than beam=3, negligible quality loss for Swedish
         temperature=0.0,
         # Quality knobs — suppress hallucination / repetition loops on messy audio
         condition_on_previous_text=False,   # don't let prior garbage poison next chunk
